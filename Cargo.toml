@@ -1,0 +1,17 @@
+[package]
+name = "usbd-uac2"
+description = "USB Audio Class 2.0 for usb-device"
+authors = ["Keenan Tims <ktims@gotroot.ca>"]
+version = "0.1.0"
+edition = "2024"
+keywords = ["no-std", "usb-device"]
+
+[features]
+defmt = ["dep:defmt"]
+
+[dependencies]
+byteorder-embedded-io = { version = "0.1.1", features = ["embedded-io"] }
+defmt = { version = "1.0.1", optional = true }
+embedded-io = "0.7.1"
+modular-bitfield = "0.13.1"
+usb-device = "0.3"
