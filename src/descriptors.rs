@@ -6,7 +6,7 @@ use crate::constants::*;
 use byteorder_embedded_io::{LittleEndian, WriteBytesExt};
 use embedded_io::ErrorType;
 use modular_bitfield::prelude::*;
-use usb_device::{UsbError, descriptor::DescriptorWriter};
+use usb_device::{UsbError, bus::StringIndex, descriptor::DescriptorWriter};
 
 #[derive(Debug)]
 pub struct DescriptorWriterError {
@@ -218,7 +218,7 @@ pub trait Descriptor {
     fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ClockSource {
     pub id: u8,
     pub clock_type: ClockType,
@@ -226,7 +226,7 @@ pub struct ClockSource {
     pub frequency_access: AccessControl,
     pub validity_access: AccessControl,
     pub assoc_terminal: u8,
-    pub string: u8,
+    pub string: Option<StringIndex>,
 }
 
 impl ClockSource {
@@ -243,7 +243,7 @@ impl ClockSource {
         writer.write_u8(self.bm_attributes())?; // bmAttributes
         writer.write_u8(self.bm_controls())?; // bmControls
         writer.write_u8(self.assoc_terminal)?; // bAssocTerminal
-        writer.write_u8(self.string)?; // iClockSource
+        writer.write_u8(self.string.map_or(0, |n| u8::from(n)))?; // iClockSource
 
         Ok(())
     }
@@ -271,7 +271,7 @@ impl Descriptor for ClockSource {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct InputTerminal {
     pub id: u8,
     pub terminal_type: TerminalType,
@@ -287,7 +287,7 @@ pub struct InputTerminal {
     pub underflow_control: AccessControl,
     pub overflow_control: AccessControl,
     pub phantom_power_control: AccessControl,
-    pub string: u8,
+    pub string: Option<StringIndex>,
 }
 
 impl InputTerminal {
@@ -311,7 +311,7 @@ impl InputTerminal {
                 | ((self.overflow_control as u8) << 2)
                 | ((self.phantom_power_control as u8) << 4),
         )?;
-        writer.write_u8(self.string)?;
+        writer.write_u8(self.string.map_or(0, |s| u8::from(s)))?;
         Ok(())
     }
 }
@@ -337,7 +337,7 @@ impl Descriptor for InputTerminal {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OutputTerminal {
     pub id: u8,
     pub terminal_type: TerminalType,
@@ -349,7 +349,7 @@ pub struct OutputTerminal {
     pub overload_control: AccessControl,
     pub underflow_control: AccessControl,
     pub overflow_control: AccessControl,
-    pub string: u8,
+    pub string: Option<StringIndex>,
 }
 
 impl OutputTerminal {
@@ -367,7 +367,7 @@ impl OutputTerminal {
                 | ((self.underflow_control as u8) << 6),
         )?;
         writer.write_u8(self.overflow_control as u8)?;
-        writer.write_u8(self.string)?; // iTerminal
+        writer.write_u8(self.string.map_or(0, |n| u8::from(n)))?; // iTerminal
         Ok(())
     }
 }
@@ -393,7 +393,7 @@ impl Descriptor for OutputTerminal {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Terminal {
     Input(InputTerminal),
     Output(OutputTerminal),
@@ -803,7 +803,7 @@ impl<const N: usize> Descriptor for ExtensionUnit<N> {
 //     }
 // }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 /// Enum covering basic sized audio class descriptors for building the Class-Specific
 /// AC Interface descriptor. Dynamically sized descriptors are not supported yet.
 pub enum AudioClassDescriptor {
@@ -828,6 +828,17 @@ impl AudioClassDescriptor {
             AudioClassDescriptor::ClockMultiplier(cm) => cm.write(writer),
             AudioClassDescriptor::InputTerminal(it) => it.write(writer),
             AudioClassDescriptor::OutputTerminal(ot) => ot.write(writer),
+        }
+    }
+    pub fn write_descriptor(
+        &self,
+        writer: &mut DescriptorWriter,
+    ) -> Result<(), DescriptorWriterError> {
+        match self {
+            AudioClassDescriptor::ClockSource(cs) => cs.write_descriptor(writer),
+            AudioClassDescriptor::ClockMultiplier(cm) => cm.write_descriptor(writer),
+            AudioClassDescriptor::InputTerminal(it) => it.write_descriptor(writer),
+            AudioClassDescriptor::OutputTerminal(ot) => ot.write_descriptor(writer),
         }
     }
 }
@@ -902,6 +913,116 @@ impl<const N: usize> AudioClassInterfaceDescriptor<N> {
     }
 }
 
+/// USB Device Class Definition for Audio Data Formats Type I Format Type Descriptor
+pub enum SamplingFrequencySet<'a> {
+    Discrete(&'a [u32]),
+    Continuous(u32, u32),
+}
+
+impl<'a> SamplingFrequencySet<'a> {
+    pub fn size(&self) -> u8 {
+        match self {
+            SamplingFrequencySet::Discrete(freqs) => freqs.len() as u8 * 3,
+            SamplingFrequencySet::Continuous(_, _) => 6,
+        }
+    }
+}
+
+pub struct FormatType1 {
+    pub bytes_per_sample: u8, // bSubframeSize
+    pub bit_resolution: u8,   // bBitResolution
+}
+
+impl FormatType1 {
+    fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
+        writer.write_u8(ClassSpecificASInterfaceDescriptorSubtype::FormatType as u8)?;
+        writer.write_u8(FormatType::Type1 as u8)?; // bFormatType
+        writer.write_u8(self.bytes_per_sample)?; // bSubslotSize
+        writer.write_u8(self.bit_resolution)?; // bBitResolution
+        Ok(())
+    }
+}
+
+impl Descriptor for FormatType1 {
+    const MAX_SIZE: usize = 6;
+    fn size(&self) -> u8 {
+        6
+    }
+    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
+        writer.write_u8(self.size())?;
+        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
+        self.write_payload(writer)
+    }
+    fn write_descriptor<'w, 'd>(
+        &self,
+        writer: &'w mut DescriptorWriter<'d>,
+    ) -> Result<(), DescriptorWriterError> {
+        let mut writer =
+            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
+        self.write_payload(&mut writer)
+    }
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug)]
+pub enum Type1FormatBitmap {
+    Pcm = (1 << 0),
+    Pcm8 = (1 << 1),
+    IeeeFloat = (1 << 2),
+    Alaw = (1 << 3),
+    Mulaw = (1 << 4),
+    Raw = (1 << 31),
+}
+
+pub struct AudioStreamingInterface {
+    terminal_id: u8,
+    active_alt_setting: AccessControl,
+    valid_alt_settings: AccessControl,
+    /// Only type 1 format is supported
+    format_type: FormatType,
+    format_bitmap: Type1FormatBitmap,
+    num_channels: u8,
+    channel_config: ChannelConfig,
+    string: Option<StringIndex>,
+}
+
+impl AudioStreamingInterface {
+    fn bm_controls(&self) -> u8 {
+        self.active_alt_setting as u8 | ((self.valid_alt_settings as u8) << 2)
+    }
+    fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
+        writer.write_u8(ClassSpecificASInterfaceDescriptorSubtype::General as u8)?;
+        writer.write_u8(self.terminal_id)?;
+        writer.write_u8(self.bm_controls())?;
+        writer.write_u8(self.format_type as u8)?;
+        writer.write_u32::<LittleEndian>(self.format_bitmap as u32)?;
+        writer.write_u8(self.num_channels)?;
+        writer.write(&self.channel_config.bytes)?;
+        writer.write_u8(self.string.map_or(0, |s| u8::from(s)))?;
+        Ok(())
+    }
+}
+
+impl Descriptor for AudioStreamingInterface {
+    const MAX_SIZE: usize = 16;
+    fn size(&self) -> u8 {
+        Self::MAX_SIZE as u8
+    }
+    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
+        writer.write_u8(self.size())?;
+        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
+        self.write_payload(writer)
+    }
+    fn write_descriptor<'w, 'd>(
+        &self,
+        writer: &'w mut DescriptorWriter<'d>,
+    ) -> Result<(), DescriptorWriterError> {
+        let mut writer =
+            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
+        self.write_payload(&mut writer)
+    }
+}
+
 #[cfg(test)]
 extern crate std;
 #[cfg(test)]
@@ -911,6 +1032,7 @@ mod tests {
     use std::{print, println};
     #[test]
     fn test_clock_source() {
+        let string = Some(unsafe { core::mem::transmute(10u8) });
         let cs = ClockSource {
             id: 8,
             clock_type: ClockType::InternalFixed,
@@ -918,7 +1040,7 @@ mod tests {
             frequency_access: AccessControl::ReadOnly,
             validity_access: AccessControl::ReadOnly,
             assoc_terminal: 6,
-            string: 10,
+            string,
         };
         let mut buf = [0u8; ClockSource::MAX_SIZE];
         let mut cur = Cursor::new(&mut buf[..]);
@@ -1014,7 +1136,7 @@ mod tests {
             underflow_control: AccessControl::ReadOnly,
             overflow_control: AccessControl::ReadOnly,
             phantom_power_control: AccessControl::NotPresent,
-            string: 20,
+            string: Some(unsafe { core::mem::transmute(20u8) }),
         };
         let mut buf = [0u8; InputTerminal::MAX_SIZE];
         let mut cur = Cursor::new(&mut buf[..]);
@@ -1058,7 +1180,7 @@ mod tests {
             overload_control: AccessControl::ReadOnly,
             underflow_control: AccessControl::ReadOnly,
             overflow_control: AccessControl::ReadOnly,
-            string: 20,
+            string: Some(unsafe { core::mem::transmute(20u8) }),
         };
         let mut buf = [0u8; OutputTerminal::MAX_SIZE];
         let mut cur = Cursor::new(&mut buf[..]);
@@ -1334,7 +1456,7 @@ mod tests {
                 frequency_access: AccessControl::NotPresent,
                 validity_access: AccessControl::NotPresent,
                 assoc_terminal: 0,
-                string: 0,
+                string: None,
             }
             .into(),
             InputTerminal {
@@ -1352,7 +1474,7 @@ mod tests {
                 underflow_control: AccessControl::NotPresent,
                 overflow_control: AccessControl::NotPresent,
                 phantom_power_control: AccessControl::NotPresent,
-                string: 0,
+                string: None,
             }
             .into(),
             OutputTerminal {
@@ -1366,7 +1488,7 @@ mod tests {
                 overload_control: AccessControl::NotPresent,
                 underflow_control: AccessControl::NotPresent,
                 overflow_control: AccessControl::NotPresent,
-                string: 0,
+                string: None,
             }
             .into(),
             OutputTerminal {
@@ -1380,7 +1502,7 @@ mod tests {
                 overload_control: AccessControl::NotPresent,
                 underflow_control: AccessControl::NotPresent,
                 overflow_control: AccessControl::NotPresent,
-                string: 0,
+                string: None,
             }
             .into(),
             InputTerminal {
@@ -1398,7 +1520,7 @@ mod tests {
                 underflow_control: AccessControl::NotPresent,
                 overflow_control: AccessControl::NotPresent,
                 phantom_power_control: AccessControl::NotPresent,
-                string: 0,
+                string: None,
             }
             .into(),
         ];
@@ -1418,5 +1540,71 @@ mod tests {
         }
         println!();
         write_usb_descriptor_pcap("./uac2.pcap", 0x02, 0, bytes);
+    }
+
+    #[test]
+    fn test_format_type1() {
+        let format = FormatType1 {
+            bytes_per_sample: 4,
+            bit_resolution: 24,
+        };
+        let mut buf = [0u8; FormatType1::MAX_SIZE];
+        let len = {
+            let mut cur = Cursor::new(&mut buf[..]);
+            format.write(&mut cur).unwrap();
+            cur.position()
+        };
+        let descriptor = &buf[..len];
+        assert_eq!(
+            descriptor,
+            &[
+                6,    //bLength
+                0x24, // CS_INTERFACE
+                0x02, // FORMAT_TYPE
+                0x01, // FORMAT_TYPE_I
+                4,    // bSubframeSize
+                24,   // bBitResolution
+            ]
+        );
+    }
+    fn test_as_interface_desc() {
+        let intf = AudioStreamingInterface {
+            terminal_id: 2,
+            active_alt_setting: AccessControl::Programmable,
+            valid_alt_settings: AccessControl::ReadOnly,
+            format_type: FormatType::Type1,
+            format_bitmap: Type1FormatBitmap::Pcm,
+            num_channels: 2,
+            channel_config: ChannelConfig::default_chans(2),
+            string: None,
+        };
+        let mut buf = [0u8; AudioStreamingInterface::MAX_SIZE];
+        let len = {
+            let mut cur = Cursor::new(&mut buf[..]);
+            intf.write(&mut cur).unwrap();
+            cur.position()
+        };
+        let descriptor = &buf[..len];
+        assert_eq!(
+            descriptor,
+            &[
+                16,
+                0x24,         // CS_INTERFACE
+                0x01,         // AS_GENERAL
+                2,            // bTerminalLink
+                3 | (1 << 2), // bmControls
+                1,            // bFormatType
+                1,            // bmFormats[0]
+                0,            // bmFormats[1]
+                0,            // bmFormats[2]
+                0,            // bmFormats[3]
+                2,            // bNrChannels
+                3,            // bmChannelConfig[0]
+                0,            // bmChannelConfig[1]
+                0,            // bmChannelConfig[2]
+                0,            // bmChannelConfig[3]
+                0             // iChannelNames
+            ]
+        );
     }
 }

@@ -488,3 +488,46 @@ pub enum TerminalType {
     Ext1394DaStream = 0x0606,
     Ext1394DvStreamSoundtrack = 0x0607,
 }
+
+#[repr(u16)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AudioDataFormatType1 {
+    Undefined = 0,
+    Pcm = 1,
+    Pcm8 = 2,
+    IeeeFloat = 3,
+    Alaw = 4,
+    Mulaw = 5,
+}
+
+#[repr(u16)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AudioDataFormatType2 {
+    Undefined = 0x1000,
+    Mpeg = 0x1001,
+    Ac3 = 0x1002,
+}
+
+#[repr(u16)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AudioDataFormatType3 {
+    Undefined = 0x2000,
+    Ac3 = 0x2001,
+    Mpeg1Layer1 = 0x2002,
+    Mpeg1Layer23OrMpeg2NoExt = 0x2003,
+    Mpeg2Ext = 0x2004,
+    Mpeg2Layer1Ls = 0x2005,
+    Mpeg2Layer23Ls = 0x2006,
+}
+#[repr(u8)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FormatType {
+    Undefined = 0,
+    Type1 = 1,
+    Type2 = 2,
+    Type3 = 3,
+}
