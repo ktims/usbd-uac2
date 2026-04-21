@@ -10,10 +10,8 @@ use core::marker::PhantomData;
 use constants::*;
 use descriptors::*;
 
-use usb_device::control::{Recipient, Request, RequestType};
-use usb_device::device::DEFAULT_ALTERNATE_SETTING;
+use usb_device::class_prelude::*;
 use usb_device::endpoint::{self, Endpoint, EndpointDirection, In, Out};
-use usb_device::{UsbDirection, class_prelude::*};
 
 mod sealed {
     pub trait Sealed {}
@@ -165,42 +163,58 @@ pub trait UsbAudioClockSource {
     }
 }
 
+// This trait is needed since we specialize on D
+trait TerminalConfigurationDescriptors {
+    fn get_configuration_descriptors(&self) -> (InputTerminal, OutputTerminal);
+}
+
 pub struct TerminalConfig<D: EndpointDirection> {
+    /// USB terminal in the D direction will have this id, audio terminal will have this id + 1
+    base_id: u8,
     clock_source_id: u8,
     num_channels: u8,
     format: FormatType1,
     terminal_type: TerminalType,
     channel_config: ChannelConfig,
+    sync_type: IsochronousSynchronizationType,
+    lock_delay: LockDelay,
     string: Option<StringIndex>,
     _direction: PhantomData<D>,
 }
 
-impl<'a, D: EndpointDirection> TerminalConfig<D> {
+// TODO: builder pattern
+impl<D: EndpointDirection> TerminalConfig<D> {
     pub fn new(
+        base_id: u8,
         clock_source_id: u8,
         num_channels: u8,
         format: FormatType1,
         terminal_type: TerminalType,
         channel_config: ChannelConfig,
+        sync_type: IsochronousSynchronizationType,
+        lock_delay: LockDelay,
         string: Option<StringIndex>,
     ) -> Self {
         TerminalConfig {
+            base_id,
             clock_source_id,
             num_channels,
             format,
             terminal_type,
             channel_config,
+            sync_type,
+            lock_delay,
             string,
             _direction: PhantomData,
         }
     }
 }
-impl<'a> TerminalConfig<In> {
-    fn get_configuration_descriptors(&self, start_id: u8) -> (InputTerminal, OutputTerminal) {
+impl<'a> TerminalConfigurationDescriptors for TerminalConfig<In> {
+    fn get_configuration_descriptors(&self) -> (InputTerminal, OutputTerminal) {
         let input_terminal = InputTerminal {
-            id: start_id,
+            id: self.base_id,
             terminal_type: TerminalType::UsbStreaming,
-            assoc_terminal: start_id + 1,
+            assoc_terminal: self.base_id + 1,
             clock_source: self.clock_source_id,
             num_channels: self.num_channels,
             channel_config: self.channel_config,
@@ -215,10 +229,10 @@ impl<'a> TerminalConfig<In> {
             string: None,
         };
         let output_terminal = OutputTerminal {
-            id: start_id + 1,
+            id: self.base_id + 1,
             terminal_type: self.terminal_type,
-            assoc_terminal: start_id,
-            source_id: start_id,
+            assoc_terminal: self.base_id,
+            source_id: self.base_id,
             clock_source: self.clock_source_id,
             copy_protect_control: AccessControl::NotPresent,
             connector_control: AccessControl::NotPresent,
@@ -232,13 +246,13 @@ impl<'a> TerminalConfig<In> {
     // fn get_interface_descriptor(&self, id: InterfaceIndex) )
 }
 
-impl<'a> TerminalConfig<Out> {
-    fn get_configuration_descriptors(&self, start_id: u8) -> (OutputTerminal, InputTerminal) {
+impl<'a> TerminalConfigurationDescriptors for TerminalConfig<Out> {
+    fn get_configuration_descriptors(&self) -> (InputTerminal, OutputTerminal) {
         let output_terminal = OutputTerminal {
-            id: start_id,
+            id: self.base_id,
             terminal_type: TerminalType::UsbStreaming,
-            assoc_terminal: start_id + 1,
-            source_id: start_id + 1,
+            assoc_terminal: self.base_id + 1,
+            source_id: self.base_id + 1,
             clock_source: self.clock_source_id,
             copy_protect_control: AccessControl::NotPresent,
             connector_control: AccessControl::NotPresent,
@@ -248,9 +262,9 @@ impl<'a> TerminalConfig<Out> {
             string: self.string,
         };
         let input_terminal = InputTerminal {
-            id: start_id + 1,
+            id: self.base_id + 1,
             terminal_type: self.terminal_type,
-            assoc_terminal: start_id,
+            assoc_terminal: self.base_id,
             clock_source: self.clock_source_id,
             num_channels: self.num_channels,
             channel_config: self.channel_config,
@@ -264,34 +278,42 @@ impl<'a> TerminalConfig<Out> {
             phantom_power_control: AccessControl::NotPresent,
             string: self.string,
         };
-        (output_terminal, input_terminal)
+        (input_terminal, output_terminal)
     }
-    fn write_interface_descriptors(
-        &self,
-        writer: &mut DescriptorWriter,
-        if_id: InterfaceNumber,
-    ) -> usb_device::Result<()> {
-        writer.interface(
-            if_id,
-            AUDIO,
-            InterfaceSubclass::AudioStreaming as u8,
-            InterfaceProtocol::Version2 as u8,
-        )?;
-        writer.interface_alt(
-            if_id,
-            1,
-            AUDIO,
-            InterfaceSubclass::AudioStreaming as u8,
-            InterfaceProtocol::Version2 as u8,
-            None,
-        )?;
+}
+impl<D: EndpointDirection> TerminalConfig<D> {}
 
-        // TODO:
-        // 1. Interface specific AS_GENERAL descriptor (4.9.2)
-        // 2. Format Type I descriptor
-        // 3. Endpoint descriptor
+#[derive(Copy, Clone, Debug)]
+pub enum UsbSpeed {
+    Low, // Not supported for audio
+    Full,
+    High,
+    Super, // Not supported by crate
+}
 
-        Ok(())
+/// Since usb-device doesn't expose the underlying speed of the bus, the user needs to provide an implementation.
+///
+///
+///
+/// This will be called whenever descriptors are sent to the host..
+pub trait UsbSpeedProvider {
+    fn speed(&self) -> UsbSpeed;
+}
+
+/// Convenience implementation of UsbSpeedProvider for devices which only support one speed.
+pub struct ConstSpeedProvider {
+    speed: UsbSpeed,
+}
+
+impl ConstSpeedProvider {
+    pub const fn new(speed: UsbSpeed) -> Self {
+        ConstSpeedProvider { speed }
+    }
+}
+
+impl UsbSpeedProvider for ConstSpeedProvider {
+    fn speed(&self) -> UsbSpeed {
+        self.speed
     }
 }
 
@@ -313,7 +335,8 @@ impl<'a> TerminalConfig<Out> {
 /// A single Clock Source is always required, but a fully custom descriptor set can be built by only providing
 /// the Clock Source and additional descriptors, if the Terminal descriptors are inappropriate.
 ///
-pub struct AudioClassConfig<'a, CS: UsbAudioClockSource> {
+pub struct AudioClassConfig<'a, CS: UsbAudioClockSource, SP: UsbSpeedProvider> {
+    pub speed_provider: SP,
     pub device_category: FunctionCode,
     pub clock: CS,
     pub input_config: Option<TerminalConfig<Out>>,
@@ -321,9 +344,10 @@ pub struct AudioClassConfig<'a, CS: UsbAudioClockSource> {
     pub additional_descriptors: Option<&'a [AudioClassDescriptor]>,
 }
 
-impl<'a, CS: UsbAudioClockSource> AudioClassConfig<'a, CS> {
-    pub fn new(device_category: FunctionCode, clock: CS) -> Self {
+impl<'a, SP: UsbSpeedProvider, CS: UsbAudioClockSource> AudioClassConfig<'a, CS, SP> {
+    pub fn new(speed_provider: SP, device_category: FunctionCode, clock: CS) -> Self {
         Self {
+            speed_provider,
             device_category,
             clock,
             input_config: None,
@@ -346,67 +370,10 @@ impl<'a, CS: UsbAudioClockSource> AudioClassConfig<'a, CS> {
         self.additional_descriptors = Some(additional_descriptors);
         self
     }
-    /// Writes the class-specific configuration descriptor set (after bDescriptortype INTERFACE)
-    fn get_configuration_descriptors(
-        &self,
-        writer: &mut DescriptorWriter<'_>,
-    ) -> usb_device::Result<()> {
-        // CONFIGURATION DESCRIPTORS //
-        let mut total_length: u16 = 9; // HEADER
-        let clock_desc = self.clock.get_configuration_descriptor(1, None)?;
-        total_length += clock_desc.size() as u16;
-        let output_descs = match &self.output_config {
-            Some(config) => {
-                let descs = config.get_configuration_descriptors(2);
-                total_length += descs.0.size() as u16 + descs.1.size() as u16;
-                Some(descs)
-            }
-            None => None,
-        };
-        let input_descs = match &self.input_config {
-            Some(config) => {
-                let descs = config.get_configuration_descriptors(4);
-                total_length += descs.0.size() as u16 + descs.1.size() as u16;
-                Some(descs)
-            }
-            None => None,
-        };
-        let additional_descs = match &self.additional_descriptors {
-            Some(descs) => {
-                total_length += descs.iter().map(|desc| desc.size() as u16).sum::<u16>();
-                Some(descs)
-            }
-            None => None,
-        };
-        let ac_header: [u8; 7] = [
-            ClassSpecificACInterfaceDescriptorSubtype::Header as u8,
-            0,                                  // bcdADC[0]
-            2,                                  // bcdADC[1]
-            self.device_category as u8,         // bCategory
-            (total_length & 0xff) as u8,        // wTotalLength LSB
-            ((total_length >> 8) & 0xff) as u8, // wTotalLength MSB
-            0,                                  // bmControls
-        ];
-        writer.write(ClassSpecificDescriptorType::Interface as u8, &ac_header)?;
-        clock_desc.write_descriptor(writer)?;
-        if let Some((a, b)) = output_descs {
-            a.write_descriptor(writer)?;
-            b.write_descriptor(writer)?;
-        }
-        if let Some((a, b)) = input_descs {
-            a.write_descriptor(writer)?;
-            b.write_descriptor(writer)?;
-        }
-        if let Some(descs) = additional_descs {
-            for desc in descs.into_iter() {
-                desc.write_descriptor(writer)?;
-            }
-        }
 
-        // INTERFACE DESCRIPTORS //
-
-        Ok(())
-    }
+    // pub fn build<'a, B: UsbBus>(self, alloc: &'a UsbBusAllocator) -> Result<AudioClass<'a, B>> {
+    //     Err(Error::InvalidValue)
+    // }
 }
 
 /// USB audio errors, including possible USB Stack errors
@@ -426,44 +393,197 @@ impl From<UsbError> for Error {
 type Result<T> = core::result::Result<T, Error>;
 
 struct AudioStream<'a, B: UsbBus, D: EndpointDirection> {
+    // UsbStreaming terminal ID
+    config: TerminalConfig<D>,
     interface: InterfaceNumber,
     endpoint: Endpoint<'a, B, D>,
     alt_setting: u8,
 }
 
-pub struct AudioClass<'a, CS: UsbAudioClockSource> {
-    control_iface: InterfaceNumber,
-    config: AudioClassConfig<'a, CS>,
+impl<'a, B: UsbBus, D: EndpointDirection> AudioStream<'a, B, D> {
+    fn write_interface_descriptors(&self, writer: &mut DescriptorWriter) -> usb_device::Result<()> {
+        // UAC2 4.9.1 Standard AS Interface Descriptor
+        //   zero bandwidth configuration per 3.16.2
+        //
+        // Whenever an AudioStreaming interface requires an isochronous data
+        // endpoint, it must at least provide the default Alternate Setting
+        // (Alternate Setting 0) with zero bandwidth requirements (no
+        // isochronous data endpoint defined) and an additional Alternate
+        // Setting that contains the actual isochronous data endpoint.
+        writer.interface(
+            self.interface,
+            AUDIO,
+            InterfaceSubclass::AudioStreaming as u8,
+            InterfaceProtocol::Version2 as u8,
+        )?;
+        // UAC2 4.9.1 Standard AS Interface Descriptor
+        //   live data configuration
+        writer.interface_alt(
+            self.interface,
+            1,
+            AUDIO,
+            InterfaceSubclass::AudioStreaming as u8,
+            InterfaceProtocol::Version2 as u8,
+            None,
+        )?;
+
+        // UAC2 4.9.2 Class-Specific AS Interface Descriptor
+        let as_general = AudioStreamingInterface {
+            terminal_id: self.config.base_id, // Always the USB streaming terminal id
+            active_alt_setting: AccessControl::NotPresent,
+            valid_alt_settings: AccessControl::NotPresent,
+            format_type: FormatType::Type1,
+            format_bitmap: Type1FormatBitmap::Pcm, // only PCM is supported
+            num_channels: self.config.num_channels,
+            channel_config: self.config.channel_config,
+            string: self.config.string,
+        };
+        as_general.write_descriptor(writer)?;
+
+        // UAC2 4.9.3 Class-Specific AS Format Type Descriptor
+        self.config.format.write_descriptor(writer)?;
+
+        Ok(())
+    }
+
+    fn write_endpoint_descriptors(&self, writer: &mut DescriptorWriter) -> usb_device::Result<()> {
+        // UAC2 4.10.1.1 Standard AS Isochronous Audio Data Endpoint Descriptor
+        writer.endpoint(&self.endpoint)?;
+        // UAC2 4.10.1.2 Class-Specific AS Isochronous Audio Data Endpoint Descriptor
+        let cs_ep = AudioStreamingEndpoint {
+            max_packets_only: false,
+            pitch_control: AccessControl::NotPresent,
+            overrun_control: AccessControl::NotPresent,
+            underrun_control: AccessControl::NotPresent,
+            lock_delay: self.config.lock_delay,
+        };
+        cs_ep.write_descriptor(writer)?;
+        Ok(())
+    }
 }
 
-impl<CS: UsbAudioClockSource> AudioClass<'_, CS> {}
+pub struct AudioClass<'a, B: UsbBus, CS: UsbAudioClockSource, SP: UsbSpeedProvider> {
+    config: AudioClassConfig<'a, CS, SP>,
+    control_iface: InterfaceNumber,
+    output: Option<AudioStream<'a, B, Out>>,
+    input: Option<AudioStream<'a, B, In>>,
+    feedback: Option<Endpoint<'a, B, In>>,
+}
 
-impl<B: UsbBus, CS: UsbAudioClockSource> UsbClass<B> for AudioClass<'_, CS> {
-    fn get_configuration_descriptors(
-        &self,
-        writer: &mut DescriptorWriter,
-    ) -> usb_device::Result<()> {
-        // IN, OUT, CONTROL
-        let n_interfaces = self.config.input_config.is_some() as u8
-            + self.config.output_config.is_some() as u8
-            + 1;
+impl<'a, B: UsbBus, CS: UsbAudioClockSource, SP: UsbSpeedProvider> AudioClass<'a, B, CS, SP> {
+    fn get_interface_descriptors(&self, writer: &mut DescriptorWriter) -> usb_device::Result<()> {
+        // Control + 1 or 2 streaming
+        let n_interfaces = 1
+            + (self.config.input_config.is_some() as u8)
+            + (self.config.output_config.is_some() as u8);
 
+        // UAC2 4.6 Interface Association Descriptor
         writer.iad(
             self.control_iface,
             n_interfaces,
             AUDIO,
-            FunctionSubclass::Undefined as u8,
+            InterfaceSubclass::AudioControl as u8,
             FunctionProtocol::Version2 as u8,
             None,
         )?;
+
+        // UAC2 4.7 Standard AC Interface Descriptor
         writer.interface(
             self.control_iface,
+            0,
             AUDIO,
-            InterfaceSubclass::AudioControl as u8,
             InterfaceProtocol::Version2 as u8,
         )?;
 
-        self.config.get_configuration_descriptors(writer)?;
+        // BUILD CONFIGURATION DESCRIPTORS //
+        let mut total_length: u16 = 9; // HEADER
+        let clock_desc = self.config.clock.get_configuration_descriptor(1, None)?;
+        total_length += clock_desc.size() as u16;
+        let output_descs = match &self.config.output_config {
+            Some(config) => {
+                let descs = config.get_configuration_descriptors();
+                total_length += descs.0.size() as u16 + descs.1.size() as u16;
+                Some(descs)
+            }
+            None => None,
+        };
+        let input_descs = match &self.config.input_config {
+            Some(config) => {
+                let descs = config.get_configuration_descriptors();
+                total_length += descs.0.size() as u16 + descs.1.size() as u16;
+                Some(descs)
+            }
+            None => None,
+        };
+        let additional_descs = match &self.config.additional_descriptors {
+            Some(descs) => {
+                total_length += descs.iter().map(|desc| desc.size() as u16).sum::<u16>();
+                Some(descs)
+            }
+            None => None,
+        };
+
+        // UAC2 4.7.2 Class-specific AC Interface Descriptor
+        let ac_header: [u8; 7] = [
+            ClassSpecificACInterfaceDescriptorSubtype::Header as u8,
+            0,                                  // bcdADC[0]
+            2,                                  // bcdADC[1]
+            self.config.device_category as u8,  // bCategory
+            (total_length & 0xff) as u8,        // wTotalLength LSB
+            ((total_length >> 8) & 0xff) as u8, // wTotalLength MSB
+            0,                                  // bmControls
+        ];
+        writer.write(ClassSpecificDescriptorType::Interface as u8, &ac_header)?;
+
+        // UAC2 4.7.2.1 Clock Source Descriptor
+        clock_desc.write_descriptor(writer)?;
+
+        // UAC2 4.7.2.4 & 4.7.2.5 Input & Output Terminal Descriptors
+        if let Some((a, b)) = output_descs {
+            a.write_descriptor(writer)?;
+            b.write_descriptor(writer)?;
+        }
+        if let Some((a, b)) = input_descs {
+            a.write_descriptor(writer)?;
+            b.write_descriptor(writer)?;
+        }
+
+        // UAC2 4.7
+        if let Some(descs) = additional_descs {
+            for desc in descs.into_iter() {
+                desc.write_descriptor(writer)?;
+            }
+        }
+
+        // UAC2 4.9 & 2.4.10
+        if let Some(stream) = &self.output {
+            stream.write_interface_descriptors(writer)?;
+            stream.write_endpoint_descriptors(writer)?;
+        }
+        // UAC2 4.9.2.1 Feedback Endpoint Descriptor
+        //   Should always be present if an OUT endpoint is present
+        if let Some(feedback) = &self.feedback {
+            writer.endpoint(feedback)?;
+        }
+
+        if let Some(stream) = &self.input {
+            stream.write_interface_descriptors(writer)?;
+            stream.write_endpoint_descriptors(writer)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<B: UsbBus, CS: UsbAudioClockSource, SP: UsbSpeedProvider> UsbClass<B>
+    for AudioClass<'_, B, CS, SP>
+{
+    /// Writes the class-specific configuration descriptor set (after bDescriptortype INTERFACE)
+    fn get_configuration_descriptors(
+        &self,
+        writer: &mut DescriptorWriter<'_>,
+    ) -> usb_device::Result<()> {
+        self.get_interface_descriptors(writer)?;
 
         Ok(())
     }

@@ -975,15 +975,15 @@ pub enum Type1FormatBitmap {
 }
 
 pub struct AudioStreamingInterface {
-    terminal_id: u8,
-    active_alt_setting: AccessControl,
-    valid_alt_settings: AccessControl,
+    pub terminal_id: u8,
+    pub active_alt_setting: AccessControl,
+    pub valid_alt_settings: AccessControl,
     /// Only type 1 format is supported
-    format_type: FormatType,
-    format_bitmap: Type1FormatBitmap,
-    num_channels: u8,
-    channel_config: ChannelConfig,
-    string: Option<StringIndex>,
+    pub format_type: FormatType,
+    pub format_bitmap: Type1FormatBitmap,
+    pub num_channels: u8,
+    pub channel_config: ChannelConfig,
+    pub string: Option<StringIndex>,
 }
 
 impl AudioStreamingInterface {
@@ -1019,6 +1019,77 @@ impl Descriptor for AudioStreamingInterface {
     ) -> Result<(), DescriptorWriterError> {
         let mut writer =
             DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
+        self.write_payload(&mut writer)
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockDelay {
+    Undefined(u16),
+    Milliseconds(u16),
+    DecodedSamples(u16),
+}
+impl LockDelay {
+    pub fn units(&self) -> u8 {
+        match self {
+            LockDelay::Undefined(_) => 0,
+            LockDelay::Milliseconds(_) => 1,
+            LockDelay::DecodedSamples(_) => 2,
+        }
+    }
+    pub fn value(&self) -> u16 {
+        match self {
+            LockDelay::Undefined(v) => *v,
+            LockDelay::Milliseconds(v) => *v,
+            LockDelay::DecodedSamples(v) => *v,
+        }
+    }
+}
+
+pub struct AudioStreamingEndpoint {
+    pub max_packets_only: bool,
+    pub pitch_control: AccessControl,
+    pub overrun_control: AccessControl,
+    pub underrun_control: AccessControl,
+    pub lock_delay: LockDelay,
+}
+
+impl AudioStreamingEndpoint {
+    fn bm_controls(&self) -> u8 {
+        (self.pitch_control as u8)
+            | (self.overrun_control as u8) << 2
+            | (self.underrun_control as u8) << 4
+    }
+    fn write_payload<T: embedded_io::Write>(
+        &self,
+        writer: &mut T,
+    ) -> core::result::Result<(), T::Error> {
+        writer.write_u8(ClassSpecificEndpointDescriptorSubtype::General as u8)?; // bDescriptorSubtype
+        writer.write_u8((self.max_packets_only as u8) << 7)?; // bmAttributes
+        writer.write_u8(self.bm_controls())?; // bmControls
+        writer.write_u8(self.lock_delay.units())?; // bLockDelayUnits
+        writer.write_u16::<LittleEndian>(self.lock_delay.value())?; // wLockDelay
+        Ok(())
+    }
+}
+
+impl Descriptor for AudioStreamingEndpoint {
+    const MAX_SIZE: usize = 8;
+    fn size(&self) -> u8 {
+        Self::MAX_SIZE as u8
+    }
+    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
+        writer.write_u8(self.size())?;
+        writer.write_u8(ClassSpecificDescriptorType::Endpoint as u8)?;
+        self.write_payload(writer)
+    }
+    fn write_descriptor<'w, 'd>(
+        &self,
+        writer: &'w mut DescriptorWriter<'d>,
+    ) -> Result<(), DescriptorWriterError> {
+        let mut writer =
+            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Endpoint);
         self.write_payload(&mut writer)
     }
 }
@@ -1539,7 +1610,7 @@ mod tests {
             print!("{:02x} ", b);
         }
         println!();
-        write_usb_descriptor_pcap("./uac2.pcap", 0x02, 0, bytes);
+        write_usb_descriptor_pcap("./uac2.pcap", 0x02, 0, bytes).unwrap();
     }
 
     #[test]
@@ -1604,6 +1675,38 @@ mod tests {
                 0,            // bmChannelConfig[2]
                 0,            // bmChannelConfig[3]
                 0             // iChannelNames
+            ]
+        );
+    }
+
+    #[test]
+    fn test_as_endpoint_desc() {
+        let ep = AudioStreamingEndpoint {
+            max_packets_only: true,
+            pitch_control: AccessControl::NotPresent,
+            overrun_control: AccessControl::ReadOnly,
+            underrun_control: AccessControl::Programmable,
+            lock_delay: LockDelay::DecodedSamples(1024),
+        };
+
+        let mut buf = [0u8; AudioStreamingEndpoint::MAX_SIZE];
+        let len = {
+            let mut cur = Cursor::new(&mut buf[..]);
+            ep.write(&mut cur).unwrap();
+            cur.position()
+        };
+        let descriptor = &buf[..len];
+        assert_eq!(
+            descriptor,
+            &[
+                8,
+                0x25,                    // CS_ENDPOINT
+                0x01,                    // EP_GENERAL
+                0x80,                    // bmAttributes
+                0 | (1 << 2) | (3 << 4), // bmControls
+                2,                       // bLockDelayUnits
+                (1024u16 & 0xff) as u8,  // bLockDelay[0]
+                (1024u16 >> 8) as u8,    // bLockDelay[1]
             ]
         );
     }
