@@ -1,0 +1,9 @@
+[default.general]
+chip = "LPC55S28JBD100"
+[default.rtt]
+enabled = true
+[default.gdb]
+enabled = true
+
+[debug.rtt]
+enabled = false

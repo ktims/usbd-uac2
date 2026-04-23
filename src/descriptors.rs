@@ -1,91 +1,12 @@
-use core::fmt::{Display, Formatter};
-
-use crate::constants::ClassSpecificACInterfaceDescriptorSubtype;
 use crate::constants::*;
+use crate::debug;
+use crate::error;
+use crate::{constants::ClassSpecificACInterfaceDescriptorSubtype, cursor::Cursor};
 
 use byteorder_embedded_io::{LittleEndian, WriteBytesExt};
-use embedded_io::ErrorType;
 use modular_bitfield::prelude::*;
-use usb_device::{UsbError, bus::StringIndex, descriptor::DescriptorWriter};
-
-#[derive(Debug)]
-pub struct DescriptorWriterError {
-    error: UsbError,
-}
-
-impl Display for DescriptorWriterError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "UsbError: {}",
-            match self.error {
-                UsbError::InvalidState => "InvalidState",
-                UsbError::WouldBlock => "WouldBlock",
-                UsbError::Unsupported => "Unsupported",
-                UsbError::BufferOverflow => "BufferOverflow",
-                UsbError::EndpointMemoryOverflow => "EndpointMemoryOverflow",
-                UsbError::EndpointOverflow => "EndpointOverflow",
-                UsbError::InvalidEndpoint => "InvalidEndpoint",
-                UsbError::ParseError => "ParseError",
-            }
-        )
-    }
-}
-
-impl core::error::Error for DescriptorWriterError {}
-
-impl embedded_io::Error for DescriptorWriterError {
-    fn kind(&self) -> embedded_io::ErrorKind {
-        embedded_io::ErrorKind::Other
-    }
-}
-
-impl From<UsbError> for DescriptorWriterError {
-    fn from(error: UsbError) -> Self {
-        Self { error }
-    }
-}
-
-impl From<DescriptorWriterError> for UsbError {
-    fn from(error: DescriptorWriterError) -> Self {
-        error.error
-    }
-}
-
-struct DescriptorWriterAdapter<'w, 'd> {
-    writer: &'w mut DescriptorWriter<'d>,
-    descriptor_type: ClassSpecificDescriptorType,
-    written: usize,
-}
-
-impl<'w, 'd> embedded_io::Write for DescriptorWriterAdapter<'w, 'd> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.writer.write(self.descriptor_type as u8, buf)?;
-        self.written += buf.len();
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
-impl ErrorType for DescriptorWriterAdapter<'_, '_> {
-    type Error = DescriptorWriterError;
-}
-
-impl<'w, 'd> DescriptorWriterAdapter<'w, 'd> {
-    fn new(
-        writer: &'w mut DescriptorWriter<'d>,
-        descriptor_type: ClassSpecificDescriptorType,
-    ) -> Self {
-        Self {
-            writer,
-            descriptor_type,
-            written: 0,
-        }
-    }
-}
+use usb_device::UsbError;
+use usb_device::{bus::StringIndex, descriptor::DescriptorWriter};
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -207,15 +128,35 @@ pub struct FeatureControls {
 pub trait Descriptor {
     /// The maximum possible size of the descriptor, including the length and descriptor type bytes. For creation of Sized buffers.
     const MAX_SIZE: usize;
+    /// The bDescriptorType of the descriptor
+    fn descriptor_type(&self) -> u8;
     /// The actual size of the descriptor, including the length and descriptor type bytes.
     fn size(&self) -> u8;
-    /// Write the descriptor using the provided usb_device DescriptorWriter.
+    /// The payload of the descriptor, not including the bLength and bDescriptorType bytes
+    fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error>;
+    /// Write the descriptor to the provided buffer. Includes the length and descriptor type bytes. The default implementation defers to write_payload and self.size().
+    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
+        writer.write_u8(self.size())?;
+        writer.write_u8(self.descriptor_type())?;
+        self.write_payload(writer)?;
+        Ok(())
+    }
+    /// Write the descriptor using the provided usb_device DescriptorWriter. The default implementation defers to write_payload.
     fn write_descriptor<'w, 'd>(
         &self,
         writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError>;
-    /// Write the descriptor to the provided buffer. Includes the length and descriptor type bytes.
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error>;
+    ) -> Result<(), usb_device::UsbError> {
+        debug!("writer.write {}", core::any::type_name_of_val(self));
+        writer.write_with(self.descriptor_type(), |buf| {
+            let mut cur = Cursor::new(buf);
+            if let Err(e) = self.write_payload(&mut cur) {
+                error!("Write payload err {}", defmt::Display2Format(&e));
+                Err(e.into())
+            } else {
+                Ok(cur.position())
+            }
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -236,6 +177,17 @@ impl ClockSource {
     fn bm_controls(&self) -> u8 {
         ((self.validity_access as u8) << 2) | self.frequency_access as u8
     }
+}
+
+impl Descriptor for ClockSource {
+    const MAX_SIZE: usize = 8;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
+
+    fn size(&self) -> u8 {
+        Self::MAX_SIZE as u8
+    }
 
     fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         writer.write_u8(ClassSpecificACInterfaceDescriptorSubtype::ClockSource as u8)?; // bDescriptorSubtype
@@ -244,30 +196,7 @@ impl ClockSource {
         writer.write_u8(self.bm_controls())?; // bmControls
         writer.write_u8(self.assoc_terminal)?; // bAssocTerminal
         writer.write_u8(self.string.map_or(0, |n| u8::from(n)))?; // iClockSource
-
         Ok(())
-    }
-}
-
-impl Descriptor for ClockSource {
-    const MAX_SIZE: usize = 8;
-    fn size(&self) -> u8 {
-        Self::MAX_SIZE as u8
-    }
-
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
-        self.write_payload(writer)
-    }
-
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
-        self.write_payload(&mut writer)
     }
 }
 
@@ -290,7 +219,14 @@ pub struct InputTerminal {
     pub string: Option<StringIndex>,
 }
 
-impl InputTerminal {
+impl Descriptor for InputTerminal {
+    const MAX_SIZE: usize = 17;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
+    fn size(&self) -> u8 {
+        Self::MAX_SIZE as u8
+    }
     fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         writer.write_u8(ClassSpecificACInterfaceDescriptorSubtype::InputTerminal as u8)?; // bDescriptorSubtype
         writer.write_u8(self.id)?; // bTerminalID
@@ -316,27 +252,6 @@ impl InputTerminal {
     }
 }
 
-impl Descriptor for InputTerminal {
-    const MAX_SIZE: usize = 17;
-    fn size(&self) -> u8 {
-        Self::MAX_SIZE as u8
-    }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
-        self.write_payload(writer)
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
-
-        self.write_payload(&mut writer)
-    }
-}
-
 #[derive(Clone)]
 pub struct OutputTerminal {
     pub id: u8,
@@ -352,7 +267,14 @@ pub struct OutputTerminal {
     pub string: Option<StringIndex>,
 }
 
-impl OutputTerminal {
+impl Descriptor for OutputTerminal {
+    const MAX_SIZE: usize = 12;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
+    fn size(&self) -> u8 {
+        Self::MAX_SIZE as u8
+    }
     fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         writer.write_u8(ClassSpecificACInterfaceDescriptorSubtype::OutputTerminal as u8)?; // bDescriptorSubtype
         writer.write_u8(self.id)?; // bTerminalID
@@ -372,27 +294,6 @@ impl OutputTerminal {
     }
 }
 
-impl Descriptor for OutputTerminal {
-    const MAX_SIZE: usize = 12;
-    fn size(&self) -> u8 {
-        Self::MAX_SIZE as u8
-    }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
-        self.write_payload(writer)
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
-
-        self.write_payload(&mut writer)
-    }
-}
-
 #[derive(Clone)]
 pub enum Terminal {
     Input(InputTerminal),
@@ -405,25 +306,19 @@ impl Descriptor for Terminal {
     } else {
         OutputTerminal::MAX_SIZE
     };
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
     fn size(&self) -> u8 {
         match self {
             Self::Input(t) => t.size(),
             Self::Output(t) => t.size(),
         }
     }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
+    fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         match self {
-            Self::Input(t) => t.write(writer),
-            Self::Output(t) => t.write(writer),
-        }
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        match self {
-            Self::Input(t) => t.write_descriptor(writer),
-            Self::Output(t) => t.write_descriptor(writer),
+            Self::Input(t) => t.write_payload(writer),
+            Self::Output(t) => t.write_payload(writer),
         }
     }
 }
@@ -437,7 +332,14 @@ pub struct ClockSelector<const MAX_SOURCES: usize> {
     pub string: u8, // iClockSelector
 }
 
-impl<const N: usize> ClockSelector<N> {
+impl<const N: usize> Descriptor for ClockSelector<N> {
+    const MAX_SIZE: usize = 7 + N;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
+    fn size(&self) -> u8 {
+        7 + self.n_sources
+    }
     fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         writer.write_u8(ClassSpecificACInterfaceDescriptorSubtype::ClockSelector as u8)?; // bDescriptorSubtype
         writer.write_u8(self.id)?; // bClockID
@@ -446,26 +348,6 @@ impl<const N: usize> ClockSelector<N> {
         writer.write_u8(self.selector_access as u8)?; // bmControls (CX_CLOCK_SELECTOR)
         writer.write_u8(self.string)?; // iClockSelector (last byte)
         Ok(())
-    }
-}
-
-impl<const N: usize> Descriptor for ClockSelector<N> {
-    const MAX_SIZE: usize = 7 + N;
-    fn size(&self) -> u8 {
-        7 + self.n_sources
-    }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
-        self.write_payload(writer)
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
-        self.write_payload(&mut writer)
     }
 }
 
@@ -482,6 +364,24 @@ impl ClockMultiplier {
     fn bm_controls(&self) -> u8 {
         (self.numerator_access as u8) | ((self.denominator_access as u8) << 2)
     }
+    fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<usize, T::Error> {
+        writer.write_u8(ClassSpecificACInterfaceDescriptorSubtype::ClockMultiplier as u8)?; // bDescriptorSubtype
+        writer.write_u8(self.id)?; // bClockID
+        writer.write_u8(self.source_id)?; // bCSourceID
+        writer.write_u8(self.bm_controls())?; // bmControls
+        writer.write_u8(self.string)?; // iClockMultiplier
+        Ok(self.size() as usize)
+    }
+}
+
+impl Descriptor for ClockMultiplier {
+    const MAX_SIZE: usize = 7;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
+    fn size(&self) -> u8 {
+        Self::MAX_SIZE as u8
+    }
     fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         writer.write_u8(ClassSpecificACInterfaceDescriptorSubtype::ClockMultiplier as u8)?; // bDescriptorSubtype
         writer.write_u8(self.id)?; // bClockID
@@ -489,27 +389,6 @@ impl ClockMultiplier {
         writer.write_u8(self.bm_controls())?; // bmControls
         writer.write_u8(self.string)?; // iClockMultiplier
         Ok(())
-    }
-}
-
-impl Descriptor for ClockMultiplier {
-    const MAX_SIZE: usize = 7;
-    fn size(&self) -> u8 {
-        Self::MAX_SIZE as u8
-    }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
-        self.write_payload(writer)
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
-
-        self.write_payload(&mut writer)
     }
 }
 // Feature Unit's size depends on the number of channels in its source node, which we don't have a way
@@ -617,6 +496,16 @@ impl<const N: usize> SelectorUnit<N> {
     fn bm_controls(&self) -> u8 {
         self.selector_control as u8
     }
+}
+
+impl<const N: usize> Descriptor for SelectorUnit<N> {
+    const MAX_SIZE: usize = 7 + N;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
+    fn size(&self) -> u8 {
+        7 + self.n_sources
+    }
     fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         writer.write_u8(ClassSpecificACInterfaceDescriptorSubtype::SelectorUnit as u8)?; // bDescriptorSubtype
         writer.write_u8(self.id)?; // bUnitID
@@ -625,27 +514,6 @@ impl<const N: usize> SelectorUnit<N> {
         writer.write_u8(self.bm_controls())?; // bmControls
         writer.write_u8(self.string)?; // iSelector
         Ok(())
-    }
-}
-
-impl<const N: usize> Descriptor for SelectorUnit<N> {
-    const MAX_SIZE: usize = 7 + N;
-    fn size(&self) -> u8 {
-        7 + self.n_sources
-    }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
-        self.write_payload(writer)
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
-
-        self.write_payload(&mut writer)
     }
 }
 
@@ -676,6 +544,16 @@ impl<const N: usize> ProcessingUnit<N> {
             | ((self.overflow_control as u16) << 8)
             | ((self.latency_control as u16) << 10)
     }
+}
+
+impl<const N: usize> Descriptor for ProcessingUnit<N> {
+    const MAX_SIZE: usize = 17 + N;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
+    fn size(&self) -> u8 {
+        17 + self.n_sources
+    }
     fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         writer.write_u8(ClassSpecificACInterfaceDescriptorSubtype::ProcessingUnit as u8)?; // bDescriptorSubtype
         writer.write_u8(self.id)?; // bUnitID
@@ -688,27 +566,6 @@ impl<const N: usize> ProcessingUnit<N> {
         writer.write_u16::<LittleEndian>(self.bm_controls())?; // bmControls (PU is 2 bytes in UAC2)
         writer.write_u8(self.string)?; // iProcessing
         Ok(())
-    }
-}
-
-impl<const N: usize> Descriptor for ProcessingUnit<N> {
-    const MAX_SIZE: usize = 17 + N;
-    fn size(&self) -> u8 {
-        17 + self.n_sources
-    }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
-        self.write_payload(writer)
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
-
-        self.write_payload(&mut writer)
     }
 }
 
@@ -735,6 +592,16 @@ impl<const N: usize> ExtensionUnit<N> {
             | ((self.underflow_control as u8) << 4)
             | ((self.overflow_control as u8) << 6)
     }
+}
+
+impl<const N: usize> Descriptor for ExtensionUnit<N> {
+    const MAX_SIZE: usize = 16 + N;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
+    fn size(&self) -> u8 {
+        16 + self.n_sources
+    }
     fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         writer.write_u8(ClassSpecificACInterfaceDescriptorSubtype::ExtensionUnit as u8)?; // bDescriptorSubtype
         writer.write_u8(self.id)?; // bUnitID
@@ -747,26 +614,6 @@ impl<const N: usize> ExtensionUnit<N> {
         writer.write_u8(self.bm_controls())?; // bmControls (XU is 1 byte in UAC2)
         writer.write_u8(self.string)?; // iExtension
         Ok(())
-    }
-}
-
-impl<const N: usize> Descriptor for ExtensionUnit<N> {
-    const MAX_SIZE: usize = 16 + N;
-    fn size(&self) -> u8 {
-        16 + self.n_sources
-    }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
-        self.write_payload(writer)
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
-        self.write_payload(&mut writer)
     }
 }
 // Effect unit is also variable based on its source node, leave unimplemented for now.
@@ -830,10 +677,7 @@ impl AudioClassDescriptor {
             AudioClassDescriptor::OutputTerminal(ot) => ot.write(writer),
         }
     }
-    pub fn write_descriptor(
-        &self,
-        writer: &mut DescriptorWriter,
-    ) -> Result<(), DescriptorWriterError> {
+    pub fn write_descriptor(&self, writer: &mut DescriptorWriter) -> Result<(), UsbError> {
         match self {
             AudioClassDescriptor::ClockSource(cs) => cs.write_descriptor(writer),
             AudioClassDescriptor::ClockMultiplier(cm) => cm.write_descriptor(writer),
@@ -933,33 +777,20 @@ pub struct FormatType1 {
     pub bit_resolution: u8,   // bBitResolution
 }
 
-impl FormatType1 {
+impl Descriptor for FormatType1 {
+    const MAX_SIZE: usize = 6;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
+    fn size(&self) -> u8 {
+        6
+    }
     fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         writer.write_u8(ClassSpecificASInterfaceDescriptorSubtype::FormatType as u8)?;
         writer.write_u8(FormatType::Type1 as u8)?; // bFormatType
         writer.write_u8(self.bytes_per_sample)?; // bSubslotSize
         writer.write_u8(self.bit_resolution)?; // bBitResolution
         Ok(())
-    }
-}
-
-impl Descriptor for FormatType1 {
-    const MAX_SIZE: usize = 6;
-    fn size(&self) -> u8 {
-        6
-    }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
-        self.write_payload(writer)
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
-        self.write_payload(&mut writer)
     }
 }
 
@@ -990,6 +821,16 @@ impl AudioStreamingInterface {
     fn bm_controls(&self) -> u8 {
         self.active_alt_setting as u8 | ((self.valid_alt_settings as u8) << 2)
     }
+}
+
+impl Descriptor for AudioStreamingInterface {
+    const MAX_SIZE: usize = 16;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Interface as u8
+    }
+    fn size(&self) -> u8 {
+        Self::MAX_SIZE as u8
+    }
     fn write_payload<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
         writer.write_u8(ClassSpecificASInterfaceDescriptorSubtype::General as u8)?;
         writer.write_u8(self.terminal_id)?;
@@ -1000,26 +841,6 @@ impl AudioStreamingInterface {
         writer.write(&self.channel_config.bytes)?;
         writer.write_u8(self.string.map_or(0, |s| u8::from(s)))?;
         Ok(())
-    }
-}
-
-impl Descriptor for AudioStreamingInterface {
-    const MAX_SIZE: usize = 16;
-    fn size(&self) -> u8 {
-        Self::MAX_SIZE as u8
-    }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Interface as u8)?;
-        self.write_payload(writer)
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Interface);
-        self.write_payload(&mut writer)
     }
 }
 
@@ -1061,6 +882,16 @@ impl AudioStreamingEndpoint {
             | (self.overrun_control as u8) << 2
             | (self.underrun_control as u8) << 4
     }
+}
+
+impl Descriptor for AudioStreamingEndpoint {
+    const MAX_SIZE: usize = 8;
+    fn descriptor_type(&self) -> u8 {
+        ClassSpecificDescriptorType::Endpoint as u8
+    }
+    fn size(&self) -> u8 {
+        Self::MAX_SIZE as u8
+    }
     fn write_payload<T: embedded_io::Write>(
         &self,
         writer: &mut T,
@@ -1071,26 +902,6 @@ impl AudioStreamingEndpoint {
         writer.write_u8(self.lock_delay.units())?; // bLockDelayUnits
         writer.write_u16::<LittleEndian>(self.lock_delay.value())?; // wLockDelay
         Ok(())
-    }
-}
-
-impl Descriptor for AudioStreamingEndpoint {
-    const MAX_SIZE: usize = 8;
-    fn size(&self) -> u8 {
-        Self::MAX_SIZE as u8
-    }
-    fn write<T: embedded_io::Write>(&self, writer: &mut T) -> Result<(), T::Error> {
-        writer.write_u8(self.size())?;
-        writer.write_u8(ClassSpecificDescriptorType::Endpoint as u8)?;
-        self.write_payload(writer)
-    }
-    fn write_descriptor<'w, 'd>(
-        &self,
-        writer: &'w mut DescriptorWriter<'d>,
-    ) -> Result<(), DescriptorWriterError> {
-        let mut writer =
-            DescriptorWriterAdapter::new(writer, ClassSpecificDescriptorType::Endpoint);
-        self.write_payload(&mut writer)
     }
 }
 

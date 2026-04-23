@@ -1,7 +1,32 @@
-// Copy most of embedded_io_cursor here to avoid multiple embedded-io versions in dep tree
+// Copy most of the write side of embedded_io_cursor
+//
+// Modified specifically for writing USB descriptors, not used for anything else.
 
 use core::cmp;
-use embedded_io::{BufRead, Error, ErrorKind, ErrorType, Read, Seek, SeekFrom, Write};
+use core::fmt::Display;
+use embedded_io::{BufRead, ErrorKind, ErrorType, Read, SliceWriteError, Write};
+use usb_device::UsbError;
+
+#[derive(Debug)]
+pub struct CursorError(pub UsbError);
+
+impl Display for CursorError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            UsbError::BufferOverflow => f.write_str("CursorError(UsbError::BufferOverflow))"),
+            UsbError::WouldBlock => f.write_str("CursorError(UsbError::WouldBlock))"),
+            _ => f.write_str("CursorError(UsbError::<not-printed>)"),
+        }
+    }
+}
+
+impl core::error::Error for CursorError {}
+
+impl embedded_io::Error for CursorError {
+    fn kind(&self) -> ErrorKind {
+        ErrorKind::Other
+    }
+}
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Cursor<T> {
@@ -89,7 +114,13 @@ where
 }
 
 impl<T> ErrorType for Cursor<T> {
-    type Error = ErrorKind;
+    type Error = CursorError;
+}
+
+impl From<CursorError> for UsbError {
+    fn from(value: CursorError) -> Self {
+        value.0
+    }
 }
 
 // Read implementation for AsRef<[u8]> types
@@ -125,34 +156,38 @@ where
 }
 
 // Seek implementation for AsRef<[u8]> types
-impl<T> Seek for Cursor<T>
-where
-    T: AsRef<[u8]>,
-{
-    fn seek(&mut self, style: SeekFrom) -> Result<u64, Self::Error> {
-        let (base_pos, offset) = match style {
-            SeekFrom::Start(n) => {
-                self.pos = n as usize;
-                return Ok(n);
-            }
-            SeekFrom::End(n) => (self.inner.as_ref().len() as u64, n),
-            SeekFrom::Current(n) => (self.pos as u64, n),
-        };
+// impl<T> Seek for Cursor<T>
+// where
+//     T: AsRef<[u8]>,
+// {
+//     fn seek(&mut self, style: SeekFrom) -> Result<u64, Self::Error> {
+//         let (base_pos, offset) = match style {
+//             SeekFrom::Start(n) => {
+//                 self.pos = n as usize;
+//                 return Ok(n);
+//             }
+//             SeekFrom::End(n) => (self.inner.as_ref().len() as u64, n),
+//             SeekFrom::Current(n) => (self.pos as u64, n),
+//         };
 
-        match base_pos.checked_add_signed(offset) {
-            Some(n) => {
-                self.pos = n as usize;
-                Ok(self.pos as u64)
-            }
-            None => Err(ErrorKind::InvalidInput),
-        }
-    }
-}
+//         match base_pos.checked_add_signed(offset) {
+//             Some(n) => {
+//                 self.pos = n as usize;
+//                 Ok(self.pos as u64)
+//             }
+//             None => Err(ErrorKind::InvalidInput),
+//         }
+//     }
+// }
 
 /// Helper function for writing to fixed-size slices
-fn slice_write(pos_mut: &mut usize, slice: &mut [u8], buf: &[u8]) -> Result<usize, ErrorKind> {
+fn slice_write(
+    pos_mut: &mut usize,
+    slice: &mut [u8],
+    buf: &[u8],
+) -> Result<usize, SliceWriteError> {
     let pos = cmp::min(*pos_mut, slice.len()) as usize;
-    let amt = (&mut slice[pos..]).write(buf).map_err(|err| err.kind())?;
+    let amt = (&mut slice[pos..]).write(buf)?;
     *pos_mut += amt;
     Ok(amt)
 }
@@ -160,7 +195,10 @@ fn slice_write(pos_mut: &mut usize, slice: &mut [u8], buf: &[u8]) -> Result<usiz
 // Write implementation for &mut [u8]
 impl Write for Cursor<&mut [u8]> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        slice_write(&mut self.pos, self.inner, buf)
+        slice_write(&mut self.pos, self.inner, buf).map_err(|e| match e {
+            SliceWriteError::Full => CursorError(UsbError::BufferOverflow),
+            _ => CursorError(UsbError::Unsupported),
+        })
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {

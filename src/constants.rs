@@ -1,4 +1,4 @@
-pub const AUDIO: u8 = 0x1;
+pub const USB_CLASS_AUDIO: u8 = 0x1;
 pub const HEADER: u8 = 0x1;
 
 /// A.2 Audio Function Subclass Codes
@@ -136,6 +136,18 @@ pub enum ClassSpecificRequest {
     Mem = 3,
 }
 
+impl From<u8> for ClassSpecificRequest {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Undefined,
+            1 => Self::Cur,
+            2 => Self::Range,
+            3 => Self::Mem,
+            _ => Self::Undefined,
+        }
+    }
+}
+
 /// A.15 Encoder Type Codes
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -167,6 +179,18 @@ pub enum ClockSourceControlSelector {
     SamFreqControl = 1,
     ClockValidControl = 2,
 }
+
+impl From<u8> for ClockSourceControlSelector {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Undefined,
+            1 => Self::SamFreqControl,
+            2 => Self::ClockValidControl,
+            _ => Self::Undefined,
+        }
+    }
+}
+
 /// A.17.2 Clock Selector Control Selectors
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
