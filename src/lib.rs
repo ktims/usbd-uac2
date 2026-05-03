@@ -703,6 +703,10 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
         }
 
         // UAC2 4.9 & 2.4.10
+        if let Some(stream) = &self.input {
+            stream.write_interface_descriptors(writer)?;
+            stream.write_endpoint_descriptors(writer)?;
+        }
         if let Some(stream) = &self.output {
             stream.write_interface_descriptors(writer)?;
             stream.write_endpoint_descriptors(writer)?;
@@ -712,11 +716,6 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
         if let Some(feedback) = &self.feedback {
             debug!("writer.endpoint (feedback)");
             writer.endpoint(feedback)?;
-        }
-
-        if let Some(stream) = &self.input {
-            stream.write_interface_descriptors(writer)?;
-            stream.write_endpoint_descriptors(writer)?;
         }
 
         Ok(())
@@ -738,6 +737,39 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
             RequestType::Class => self.class_request_in(xfer),
             _ => {
                 debug!("   Unimplemented.");
+            }
+        }
+    }
+    fn endpoint_out(&mut self, addr: EndpointAddress) {
+        debug!("EP {} out data", addr);
+        if addr.index() == self.out_ep {
+            self.audio_impl
+                .audio_data_rx(&self.output.as_ref().unwrap().endpoint)
+        } else {
+            debug!("  unexpected OUT on {}", addr);
+        }
+    }
+
+    fn poll(&mut self) {
+        debug!("poll");
+        // no streaming in alt 0
+        if self.output.as_ref().unwrap().alt_setting != 1 {
+            return;
+        }
+        loop {
+            let mut buf = [0; 1024];
+            match self.output.as_ref().unwrap().endpoint.read(&mut buf) {
+                Ok(len) if len > 0 => {
+                    debug!("EP OUT data {:?}", len);
+                }
+                Ok(_) => {
+                    debug!("EP OUT empty");
+                    break;
+                }
+                Err(UsbError::WouldBlock) => break,
+                Err(err) => {
+                    debug!("EP OUT error {:?}", err);
+                }
             }
         }
     }
@@ -816,6 +848,11 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                 self.output.as_mut().unwrap().alt_setting = alt_setting;
                 xfer.accept().ok();
             }
+        } else {
+            debug!(
+                "   not handled (in: {}, out: {}, got: {}).",
+                self.in_iface, self.out_iface, iface
+            );
         }
     }
     fn get_alt_interface(&mut self, xfer: ControlIn<B>) {
@@ -985,7 +1022,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                 debug!("   SamplingFreqControl");
                 if channel != 0 {
                     error!(
-                        "   Invalid channel {} for SamplingFreqControl GET RANGE. Ignoring.",
+                        "   Invalid channel {} for SamplingFreqControl GET CUR. Ignoring.",
                         channel
                     );
                 }
@@ -1000,7 +1037,28 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                 })
                 .ok();
             }
-            _ => debug!("   Unimplemented."),
+            Ok(ClockSourceControlSelector::ClockValidControl) => {
+                debug!("   ClockValidControl");
+                if channel != 0 {
+                    error!(
+                        "   Invalid channel {} for ClockValidControl GET CUR. Ignoring.",
+                        channel
+                    );
+                }
+                xfer.accept(|mut buf| match self.clock_impl.get_clock_validity() {
+                    Ok(valid) => {
+                        debug!("    {}", valid);
+                        buf.write_u8(valid as u8)
+                            .map_err(|_e| UsbError::BufferOverflow)?;
+                        Ok(1)
+                    }
+                    Err(_e) => Err(UsbError::InvalidState),
+                })
+                .ok();
+            }
+            _ => {
+                debug!("   Unimplemented.");
+            }
         }
     }
     fn get_clock_range(&mut self, xfer: ControlIn<B>, channel: u8, control: u8) {
@@ -1031,6 +1089,19 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
             }
             _ => {
                 debug!("   Unimplemented.");
+            }
+        }
+    }
+    pub fn read(&mut self, buf: &mut [u8]) -> usb_device::Result<usize> {
+        match self.output.as_mut().unwrap().endpoint.read(buf) {
+            Ok(len) => {
+                debug!("NO CB read {} bytes", len);
+                Ok(len)
+            }
+            Err(UsbError::WouldBlock) => Err(UsbError::WouldBlock),
+            Err(e) => {
+                error!("read error");
+                Err(e)
             }
         }
     }

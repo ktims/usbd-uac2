@@ -3,7 +3,7 @@ MEMORY
   FLASH : ORIGIN = 0x00000000, LENGTH = 512K
 
   /* for use with standard link.x */
-  RAM : ORIGIN = 0x20000000, LENGTH = 64K
+  RAM : ORIGIN = 0x20000000, LENGTH = 192K
 
   /* would be used with proper link.x */
   /* needs changes to r0 (initialization code) */
@@ -18,9 +18,4 @@ MEMORY
 
   /* USB1 SRAM regin */
   /* USB1_SRAM : ORIGIN = 0x40100000, LENGTH = 16K */
-
-  /* To define our own USB RAM section in one regular */
-  /* RAM, probably easiest to shorten length of RAM */
-  /* above, and use this freed RAM section */
-
 }
