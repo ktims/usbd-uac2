@@ -108,7 +108,7 @@ impl Audio {
 
         if stat.txerr().bit_is_set() {
             self.i2s.i2s.fifostat.modify(|_, w| w.txerr().set_bit());
-            defmt::error!("fifo tx error, txlvl: {}", stat.txlvl().bits());
+            // defmt::error!("fifo tx error, txlvl: {}", stat.txlvl().bits());
         }
         if stat.txlvl().bits() <= 6 {
             // fifo is 8 deep
@@ -122,7 +122,7 @@ impl Audio {
                     .fifowr
                     .write(|w| unsafe { w.bits(sample.1 as u32) });
             } else {
-                defmt::error!("queue underflow");
+                // defmt::error!("queue underflow");
                 self.i2s.i2s.fifowr.write(|w| unsafe { w.bits(0 as u32) });
             }
         }
