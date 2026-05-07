@@ -106,8 +106,8 @@ impl<T: RangeType + PartialOrd> PartialOrd for RangeEntry<T> {
 /// Fixed point 10.14, packed to the least significant 3-bytes of a 4-byte USB feedback endpoint response
 #[derive(Copy, Clone)]
 pub struct UsbIsochronousFeedback {
-    int: u16,
-    frac: u16,
+    pub int: u16,
+    pub frac: u16,
 }
 
 impl UsbIsochronousFeedback {
@@ -164,13 +164,12 @@ pub trait UsbAudioClass<'a, B: UsbBus> {
     fn audio_data_rx(&mut self, ep: &Endpoint<'a, B, endpoint::Out>) {}
 
     /// Called when it's time to send an isochronous feedback update. Should
-    /// return the correct feedback payload. Should not be considered a great
-    /// timing reference. Better to track sample timing using other means (even
-    /// `audio_data_rx`).
+    /// return the correct feedback payload. Feedback always runs at 1ms (in
+    /// this implementation), and will be passed the nominal frame size.
     ///
     /// Required for isochronous asynchronous mode to work properly. If None is
     /// returned, no IN packet will be emitted at feedback time.
-    fn feedback(&mut self) -> Option<UsbIsochronousFeedback> {
+    fn feedback(&mut self, nominal_rate: UsbIsochronousFeedback) -> Option<UsbIsochronousFeedback> {
         None
     }
 
@@ -191,8 +190,13 @@ pub trait UsbAudioClass<'a, B: UsbBus> {
 pub trait UsbAudioClockImpl {
     const CLOCK_TYPE: ClockType;
     const SOF_SYNC: bool;
-    /// Called when the host requests the current sample rate. Returns the sample rate in Hz.
-    fn get_sample_rate(&self) -> core::result::Result<u32, UsbAudioClassError>;
+    /// Called when the host or class needs the current sample rate. Returns the
+    /// sample rate in Hz. It should be cheap and infallible as it gets called in every cycle
+    /// of the feedback loop. Use clock validity to signal to the host if the clock is not usable.
+    ///
+    /// Should never return 0 as it may be used in divides in the feedback loop
+    /// and that would cause a hard fault.
+    fn get_sample_rate(&self) -> u32;
     /// Called when the host requests to set the sample rate. Not necessarily called at all startups,
     /// so alt_setting should start/stop the clock. Not required for 'fixed' clocks.
     fn set_sample_rate(
@@ -468,9 +472,9 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
     /// Allocate the various USB IDs, and build the class implementation
     pub fn build(self, alloc: &'a UsbBusAllocator<B>) -> Result<AudioClass<'a, B, CS, AU>> {
         let speed = self.speed;
-        let interval = match speed {
-            UsbSpeed::Full => 1,
-            UsbSpeed::High | UsbSpeed::Super => 4, // rate = 2^(4-1) * 125us = 1ms, same as full speed
+        let (interval, fb_interval, audio_rate) = match speed {
+            UsbSpeed::Full => (1, 1, 1000),
+            UsbSpeed::High | UsbSpeed::Super => (1, 4, 8000), //
             UsbSpeed::Low => return Err(Error::InvalidSpeed),
         };
         let max_rate = self
@@ -498,6 +502,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
             out_ep: 0,
             fb_ep: 0,
             speed,
+            audio_rate,
         };
 
         if let Some(config) = self.output_config {
@@ -505,14 +510,14 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
             let endpoint = alloc.isochronous(
                 config.sync_type,
                 IsochronousUsageType::Data,
-                ((config.bytes_per_frame() * max_rate) / 1000) as u16,
+                (max_rate.div_ceil(audio_rate) * config.bytes_per_frame()) as u16,
                 interval,
             );
             let feedback_ep = alloc.isochronous(
                 IsochronousSynchronizationType::NoSynchronization,
                 IsochronousUsageType::Feedback,
                 4,
-                interval,
+                fb_interval,
             );
             let alt_setting = DEFAULT_ALTERNATE_SETTING;
             ac.out_iface = interface.into();
@@ -532,7 +537,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
             let endpoint = alloc.isochronous(
                 config.sync_type,
                 IsochronousUsageType::Data,
-                ((config.bytes_per_frame() * max_rate) / 1000) as u16,
+                (max_rate.div_ceil(audio_rate) * config.bytes_per_frame()) as u16,
                 interval,
             );
             let alt_setting = DEFAULT_ALTERNATE_SETTING;
@@ -664,6 +669,7 @@ pub struct AudioClass<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a
     out_ep: usize,
     fb_ep: usize,
     speed: UsbSpeed,
+    audio_rate: u32, // audio packet rate in hz
 }
 
 impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
@@ -811,19 +817,25 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
                 .audio_data_rx(&self.output.as_ref().unwrap().endpoint);
             let new_count = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-            if new_count.is_multiple_of(1 as usize) {
-                if let Some(fb) = self.audio_impl.feedback() {
-                    debug!("  emitting feedback IN {:08x}", fb.to_u32_12_13());
-                    let r = match self.speed {
-                        UsbSpeed::Low | UsbSpeed::Full => {
-                            self.feedback.as_ref().unwrap().write(&fb.to_bytes_10_14())
-                        }
-                        UsbSpeed::High | UsbSpeed::Super => {
-                            self.feedback.as_ref().unwrap().write(&fb.to_bytes_12_13())
-                        }
+            if let Some(fb_ep) = self.feedback.as_ref() {
+                if new_count.is_multiple_of(1 << (fb_ep.interval() - 1) as usize) {
+                    let cur_rate = self.clock_impl.get_sample_rate();
+                    let numerator = (cur_rate as u64) << 16;
+                    let raw = (numerator + self.audio_rate as u64 / 2) / (self.audio_rate as u64);
+                    let nominal_rate = UsbIsochronousFeedback {
+                        int: (raw >> 16) as u16,
+                        frac: (raw & 0xffff) as u16,
                     };
-                    if let Err(e) = r {
-                        warn!("  feedback IN failed {:?}", e);
+
+                    if let Some(fb) = self.audio_impl.feedback(nominal_rate) {
+                        debug!("  emitting feedback IN {:08x}", fb.to_u32_12_13());
+                        let r = match self.speed {
+                            UsbSpeed::Low | UsbSpeed::Full => fb_ep.write(&fb.to_bytes_10_14()),
+                            UsbSpeed::High | UsbSpeed::Super => fb_ep.write(&fb.to_bytes_12_13()),
+                        };
+                        if let Err(e) = r {
+                            warn!("  feedback IN failed {:?}", e);
+                        }
                     }
                 }
             }
@@ -1118,14 +1130,13 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                         channel
                     );
                 }
-                xfer.accept(|mut buf| match self.clock_impl.get_sample_rate() {
-                    Ok(rate) => {
-                        debug!("    {}", rate);
-                        buf.write_u32::<LittleEndian>(rate)
-                            .map_err(|_e| UsbError::BufferOverflow)?;
-                        Ok(4)
-                    }
-                    Err(_e) => Err(UsbError::InvalidState),
+                xfer.accept(|mut buf| {
+                    let rate = self.clock_impl.get_sample_rate();
+
+                    debug!("    {}", rate);
+                    buf.write_u32::<LittleEndian>(rate)
+                        .map_err(|_e| UsbError::BufferOverflow)?;
+                    Ok(4)
                 })
                 .ok();
             }
