@@ -6,14 +6,17 @@ mod cursor;
 pub mod descriptors;
 mod log;
 
+use core::cell::OnceCell;
 use core::cmp::Ordering;
 use core::marker::PhantomData;
+use core::sync::atomic::AtomicUsize;
 
 use byteorder_embedded_io::{LittleEndian, WriteBytesExt};
 use constants::*;
 use descriptors::*;
 use log::*;
 
+use modular_bitfield::prelude::*;
 use num_traits::{ConstZero, Zero};
 use usb_device::control::{Recipient, Request, RequestType};
 use usb_device::device::DEFAULT_ALTERNATE_SETTING;
@@ -102,6 +105,53 @@ impl<T: RangeType + PartialOrd> PartialOrd for RangeEntry<T> {
     }
 }
 
+/// Fixed point 10.14, packed to the least significant 3-bytes of a 4-byte USB feedback endpoint response
+#[derive(Copy, Clone)]
+pub struct UsbIsochronousFeedback {
+    int: u16,
+    frac: u16,
+}
+
+impl UsbIsochronousFeedback {
+    /// Accepts all u16 values, saturating the output depending on format
+    pub fn new_frac(int: u16, frac: u16) -> Self {
+        Self { int, frac }
+    }
+    /// Assumed 16.16, not either of the USB formats
+    pub fn new(value: u32) -> Self {
+        Self {
+            int: (value >> 16) as u16,
+            frac: (value & 0xffff) as u16,
+        }
+    }
+    /// Serialize into a u32 in 16.16 representation for USB HS
+    pub fn to_u32_12_13(&self) -> u32 {
+        let int = (self.int as u32) << 16;
+        // ostensibly 13 bits, so should require << 3, but USB allows us to use
+        // these bits for 'extra precision'. So we may as well just treat it as
+        // 16.16. The application can << 3 if it wants to for some reason.
+        let frac = (self.frac as u32) & 0xffff;
+
+        int | frac
+    }
+    /// Serialize into a u32 in 10.14 representation for USB FS (take the 3 LSB)
+    pub fn to_u32_10_14(&self) -> u32 {
+        let int = (self.int as u32) << 14;
+        let frac = (self.frac as u32) & 0x3fff;
+
+        int | frac
+    }
+    /// Serialize into 16.16 little endian byte array for USB HS
+    pub fn to_bytes_12_13(&self) -> [u8; 4] {
+        self.to_u32_12_13().to_le_bytes()
+    }
+    /// Serialize into 10.14 little endian byte array for USB FS
+    pub fn to_bytes_10_14(&self) -> [u8; 3] {
+        let bytes = self.to_u32_10_14().to_le_bytes();
+        [bytes[0], bytes[1], bytes[2]]
+    }
+}
+
 /// A trait for implementing USB Audio Class 2 devices
 ///
 /// Contains callback methods which will be called by the class driver. All
@@ -114,6 +164,17 @@ pub trait UsbAudioClass<'a, B: UsbBus> {
     /// Called when audio data is received from the host. `ep` is ready for
     /// `ep.read()`.
     fn audio_data_rx(&self, ep: &Endpoint<'a, B, endpoint::Out>) {}
+
+    /// Called when it's time to send an isochronous feedback update. Should
+    /// return the correct feedback payload. Should not be considered a great
+    /// timing reference. Better to track sample timing using other means (even
+    /// `audio_data_rx`).
+    ///
+    /// Required for isochronous asynchronous mode to work properly. If None is
+    /// returned, no IN packet will be emitted at feedback time.
+    fn feedback(&self) -> Option<UsbIsochronousFeedback> {
+        None
+    }
 
     /// Called when the alternate setting of `terminal`'s interface is changed,
     /// before the `AudioStream` is updated. Currently not very useful since we
@@ -437,6 +498,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
             in_ep: 0,
             out_ep: 0,
             fb_ep: 0,
+            speed,
         };
 
         if let Some(config) = self.output_config {
@@ -601,6 +663,7 @@ pub struct AudioClass<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a
     in_ep: usize,
     out_ep: usize,
     fb_ep: usize,
+    speed: UsbSpeed,
 }
 
 impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
@@ -742,9 +805,28 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
     }
     fn endpoint_out(&mut self, addr: EndpointAddress) {
         debug!("EP {} out data", addr);
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
         if addr.index() == self.out_ep {
             self.audio_impl
-                .audio_data_rx(&self.output.as_ref().unwrap().endpoint)
+                .audio_data_rx(&self.output.as_ref().unwrap().endpoint);
+            let new_count = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+            if new_count.is_multiple_of(1 as usize) {
+                if let Some(fb) = self.audio_impl.feedback() {
+                    debug!("  emitting feedback IN {:08x}", fb.to_u32_12_13());
+                    let r = match self.speed {
+                        UsbSpeed::Low | UsbSpeed::Full => {
+                            self.feedback.as_ref().unwrap().write(&fb.to_bytes_10_14())
+                        }
+                        UsbSpeed::High | UsbSpeed::Super => {
+                            self.feedback.as_ref().unwrap().write(&fb.to_bytes_12_13())
+                        }
+                    };
+                    if let Err(e) = r {
+                        warn!("  feedback IN failed {:?}", e);
+                    }
+                }
+            }
         } else {
             debug!("  unexpected OUT on {}", addr);
         }
