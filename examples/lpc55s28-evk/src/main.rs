@@ -35,113 +35,21 @@ use usbd_uac2::{
     descriptors::{ChannelConfig, ClockType, FormatType1, LockDelay},
 };
 
+mod hw;
 mod wm8904;
-
-struct PllConstants {
-    m: u16,   // 1-65535
-    n: u8,    // 1-255
-    p: u8,    // 1-31
-    selp: u8, // 5 bits
-    seli: u8, // 6 bits
-}
-
-impl PllConstants {
-    const fn new(n: u8, m: u16, p: u8) -> Self {
-        assert!(n != 0, "1 <= N <= 255");
-        assert!(m != 0, "1 <= M <= 65535");
-        assert!(p != 0 && p <= 31, "1 <= P <= 31");
-
-        // Following ripped from lpc55-hal and made const
-        // UM 4.6.6.3.2
-        let selp = {
-            let v = (m >> 2) + 1;
-            if v < 31 { v } else { 31 }
-        } as u8;
-
-        let seli = {
-            let v = match m {
-                m if m >= 8000 => 1,
-                m if m >= 122 => 8000 / m,
-                _ => 2 * (m >> 2) + 3,
-            };
-
-            if v < 63 { v } else { 63 }
-        } as u8;
-        // let seli = min(2*(m >> 2) + 3, 63);
-        Self {
-            n,
-            m,
-            p,
-            selp,
-            seli,
-        }
-    }
-}
-
-impl defmt::Format for PllConstants {
-    fn format(&self, fmt: defmt::Formatter) {
-        let factor = f32::from(self.m) / (f32::from(self.n) * 2.0 * f32::from(self.p));
-
-        defmt::write!(
-            fmt,
-            "m: {} n: {} p: {} selp: {} seli: {} fout: fin * {}",
-            self.m,
-            self.n,
-            self.p,
-            self.selp,
-            self.seli,
-            factor
-        );
-    }
-}
 
 const CODEC_I2C_ADDR: u8 = 0b0011010;
 // Fo = M/(N*2*P) * Fin
 // Fo = 3072/(125*2*8) * 16MHz = 24.576MHz
-const AUDIO_PLL: PllConstants = PllConstants::new(125, 3072, 8);
+const AUDIO_PLL: hw::PllConstants = hw::PllConstants::new(125, 3072, 8);
 const FIFO_LENGTH: usize = 2048; // frames
-const MCLK_FREQ: u32 = 24576000;
+const MCLK_FREQ: u32 = 12288000;
 const SAMPLE_RATE: u32 = 48000;
 type SampleType = (i32, i32);
 
-// const SINE_LUT: [i32; 32] = [
-//     0, 1636536, 3210180, 4660460, 5931640, 6974871, 7750062, 8227422, 8388607, 8227422, 7750062,
-//     6974871, 5931640, 4660460, 3210180, 1636536, 0, -1636536, -3210180, -4660460, -5931640,
-//     -6974871, -7750062, -8227422, -8388607, -8227422, -7750062, -6974871, -5931640, -4660460,
-//     -3210180, -1636536,
-// ];
-
-// pub fn i2s_sine_test(i2s: &pac::I2S7) -> ! {
-//     let mut idx = 0;
-//     let mut count = 0usize;
-
-//     defmt::debug!("starting sine test");
-
-//     loop {
-//         if i2s.fifostat.read().txnotfull().bit_is_set() {
-//             let sample = SINE_LUT[idx] * 32;
-
-//             // ✅ Left channel
-//             i2s.fifowr.write(|w| unsafe { w.bits(sample as u32) });
-
-//             // wait for space if needed
-//             while !i2s.fifostat.read().txnotfull().bit_is_set() {}
-
-//             // ✅ Right channel
-//             i2s.fifowr.write(|w| unsafe { w.bits(sample as u32) });
-
-//             idx = (idx + 1) & (SINE_LUT.len() - 1);
-//             count += 1;
-//             if count.is_multiple_of(48000) {
-//                 defmt::debug!("frames sent: {}", count)
-//             }
-//         }
-//     }
-// }
-
 struct Clock {}
 impl Clock {
-    const RATES: [RangeEntry<u32>; 1] = [RangeEntry::new_fixed(48000)];
+    const RATES: [RangeEntry<u32>; 1] = [RangeEntry::new_fixed(SAMPLE_RATE)];
 }
 impl UsbAudioClockImpl for Clock {
     const CLOCK_TYPE: usbd_uac2::descriptors::ClockType = ClockType::InternalFixed;
@@ -162,18 +70,31 @@ impl UsbAudioClockImpl for Clock {
 #[derive(Default)]
 struct PerfCounters {
     frames: AtomicUsize,
-    avg_fill: AtomicI32, // i32 to simplify averaging
+    min_fill: AtomicUsize,
+    avg_fill: AtomicUsize,
     queue_underflows: AtomicUsize,
     queue_overflows: AtomicUsize,
     audio_underflows: AtomicUsize,
+}
+
+impl PerfCounters {
+    fn reset(&self) {
+        self.frames.store(0, Ordering::Relaxed);
+        self.min_fill.store(FIFO_LENGTH, Ordering::Relaxed);
+        self.avg_fill.store(FIFO_LENGTH / 2, Ordering::Relaxed);
+        self.queue_underflows.store(0, Ordering::Relaxed);
+        self.queue_overflows.store(0, Ordering::Relaxed);
+        self.audio_underflows.store(0, Ordering::Relaxed);
+    }
 }
 
 impl defmt::Format for PerfCounters {
     fn format(&self, fmt: defmt::Formatter) {
         defmt::write!(
             fmt,
-            "frames: {} avg fill: {} a_underflows: {} q_underflows: {} q_overflows: {}",
+            "frames: {} min_fill: {} avg fill: {} a_underflows: {} q_underflows: {} q_overflows: {}",
             self.frames.load(Ordering::Relaxed),
+            self.min_fill.load(Ordering::Relaxed),
             self.avg_fill.load(Ordering::Relaxed),
             self.audio_underflows.load(Ordering::Relaxed),
             self.queue_underflows.load(Ordering::Relaxed),
@@ -185,9 +106,22 @@ impl defmt::Format for PerfCounters {
 static FIFO_CONSUMER_STORE: StaticCell<Consumer<SampleType>> = StaticCell::new();
 static mut FIFO_CONSUMER: *mut Consumer<SampleType> = null_mut();
 
+static PERF: PerfCounters = PerfCounters {
+    frames: AtomicUsize::new(0),
+    min_fill: AtomicUsize::new(FIFO_LENGTH),
+    avg_fill: AtomicUsize::new(FIFO_LENGTH / 2),
+    queue_underflows: AtomicUsize::new(0),
+    queue_overflows: AtomicUsize::new(0),
+    audio_underflows: AtomicUsize::new(0),
+};
+
 #[interrupt]
 fn FLEXCOMM7() {
     let i2s = unsafe { &*pac::I2S7::ptr() };
+
+    if i2s.fifostat.read().txlvl().bits() == 0 {
+        PERF.audio_underflows.fetch_add(1, Ordering::Relaxed);
+    }
 
     // refil the buffer to 4 frames / 8 samples
     while i2s.fifostat.read().txlvl().bits() <= 6 {
@@ -196,6 +130,8 @@ fn FLEXCOMM7() {
             i2s.fifowr.write(|w| unsafe { w.bits(l as u32) });
             i2s.fifowr.write(|w| unsafe { w.bits(r as u32) });
         } else {
+            PERF.queue_underflows.fetch_add(1, Ordering::Relaxed);
+            PERF.min_fill.fetch_add(0, Ordering::Relaxed);
             i2s.fifowr.write(|w| unsafe { w.bits(0) });
             i2s.fifowr.write(|w| unsafe { w.bits(0) });
         }
@@ -206,45 +142,9 @@ struct Audio<'a> {
     running: AtomicBool,
     i2s: I2sTx,
     producer: UnsafeCell<heapless::spsc::Producer<'a, SampleType>>,
-    perf: PerfCounters,
     integrator: AtomicI32,
 }
 impl<'a> Audio<'a> {
-    // fn poll(&self) {
-    //     if !self.running.load(Ordering::Relaxed) {
-    //         return;
-    //     }
-
-    //     if self.i2s.i2s.fifostat.read().txerr().bit_is_set() {
-    //         self.i2s.i2s.fifostat.modify(|_, w| w.txerr().set_bit());
-    //         // defmt::error!("fifo tx error, txlvl: {}", stat.txlvl().bits());
-    //     }
-    //     if self.i2s.i2s.fifostat.read().txlvl().bits() == 0 {
-    //         self.perf.audio_underflows.fetch_add(1, Ordering::Relaxed);
-    //     }
-    //     while self.i2s.i2s.fifostat.read().txlvl().bits() <= 6 {
-    //         // fifo is 8 deep at 32 bit samples
-    //         let fifo = self.consumer.get();
-    //         if let Some(sample) = unsafe { (*fifo).dequeue() } {
-    //             self.i2s
-    //                 .i2s
-    //                 .fifowr
-    //                 .write(|w| unsafe { w.bits(sample.0 as u32) });
-    //             self.i2s
-    //                 .i2s
-    //                 .fifowr
-    //                 .write(|w| unsafe { w.bits(sample.1 as u32) });
-    //         } else {
-    //             if self.running.load(Ordering::Relaxed) {
-    //                 self.perf.queue_underflows.fetch_add(1, Ordering::Relaxed);
-    //             }
-    //             break;
-    //             // self.i2s.i2s.fifowr.write(|w| unsafe { w.bits(0 as u32) });
-    //             // self.i2s.i2s.fifowr.write(|w| unsafe { w.bits(0 as u32) });
-    //         }
-    //         self.perf.frames.fetch_add(1, Ordering::Relaxed);
-    //     }
-    // }
     fn start(&self) {
         self.running.store(true, Ordering::Relaxed);
         defmt::info!("playback starting, enabling interrupts");
@@ -260,7 +160,8 @@ impl<'a> Audio<'a> {
     }
     fn stop(&self) {
         self.running.store(true, Ordering::Relaxed);
-        defmt::info!("playback stopped: {}", self.perf);
+        defmt::info!("playback stopped: {}", PERF);
+        PERF.reset();
         pac::NVIC::mask(pac::Interrupt::FLEXCOMM7);
     }
 }
@@ -294,7 +195,7 @@ impl<'a, B: bus::UsbBus> UsbAudioClass<'a, B> for Audio<'_> {
             )
         }) {
             if let Err(e) = unsafe { (*self.producer.get()).enqueue(sample) } {
-                self.perf.queue_overflows.fetch_add(1, Ordering::Relaxed);
+                PERF.queue_overflows.fetch_add(1, Ordering::Relaxed);
                 // defmt::error!("overflowed fifo, len: {}", unsafe {
                 //     (*self.producer.get()).len()
                 // });
@@ -305,8 +206,8 @@ impl<'a, B: bus::UsbBus> UsbAudioClass<'a, B> for Audio<'_> {
         const TARGET: i32 = FIFO_LENGTH as i32 / 2 - 64;
         const NOMINAL: i32 = 48 << 16;
 
-        let queuelen = unsafe { (*self.producer.get()).len() as i32 };
-        let error = (queuelen - TARGET).clamp(-32, 32);
+        let queuelen = unsafe { (*self.producer.get()).len() };
+        let error = (queuelen as i32 - TARGET).clamp(-32, 32);
 
         // --- integrator ---
         let scaled_error = error / 64;
@@ -332,9 +233,9 @@ impl<'a, B: bus::UsbBus> UsbAudioClass<'a, B> for Audio<'_> {
         let v = NOMINAL + (correction << 10);
 
         // EMA (unchanged, already correct)
-        let ema = self.perf.avg_fill.load(Ordering::Relaxed);
+        let ema = PERF.avg_fill.load(Ordering::Relaxed);
         let new = ((ema * 1023) + queuelen + 512) >> 10;
-        self.perf.avg_fill.store(new, Ordering::Relaxed);
+        PERF.avg_fill.store(new, Ordering::Relaxed);
 
         defmt::debug!(
             "q:{} p:{} i:{} err:{} fb:{}+{}",
@@ -457,7 +358,7 @@ pub fn init_i2s(mut fc7: pac::FLEXCOMM7, i2s7: pac::I2S7, syscon: &mut Syscon) -
             .as_ref()
             .unwrap()
             .mclkdiv
-            .modify(|_, w| w.div().bits(0).halt().run().reset().released()); // div by 1 = PLL0 fout
+            .modify(|_, w| w.div().bits(1).halt().run().reset().released()); // div by 2 = PLL0 fout / 2 = 12.288MHz
         pac::SYSCON::ptr()
             .as_ref()
             .unwrap()
@@ -488,7 +389,7 @@ pub fn init_i2s(mut fc7: pac::FLEXCOMM7, i2s7: pac::I2S7, syscon: &mut Syscon) -
     regs.cfg2
         .modify(|_, w| unsafe { w.position().bits(0).framelen().bits(63) });
 
-    regs.div.modify(|_, w| unsafe { w.div().bits(7) }); // Clock source is MCLK (24MHz on FRO96) / 8 = 3MHz
+    regs.div.modify(|_, w| unsafe { w.div().bits(3) }); // Clock source is MCLK (24MHz on FRO96) / 4 = 3MHz
 
     // Config
     regs.cfg1.modify(|_, w| unsafe {
@@ -545,10 +446,7 @@ fn main() -> ! {
     // iocon.disabled(&mut syscon).release(); // save the environment :)
 
     debug!("clocks");
-    // TODO: figure out how to configure the PLL for a more suitable audio clock.
     let clocks = hal::ClockRequirements::default()
-        // .system_frequency(24.mhz())
-        // .system_frequency(72.mhz())
         .system_frequency(96.MHz())
         .configure(&mut anactrl, &mut pmc, &mut syscon)
         .unwrap();
@@ -557,8 +455,6 @@ fn main() -> ! {
             .0
             .enabled(&mut syscon, clocks.support_1mhz_fro_token().unwrap()),
     );
-
-    debug!("pll0");
     init_audio_pll();
 
     debug!("peripherals");
@@ -598,7 +494,7 @@ fn main() -> ! {
     .unwrap();
     let (producer, consumer) = queue.split();
 
-    let consumer_ref = unsafe { FIFO_CONSUMER_STORE.init(consumer) };
+    let consumer_ref = FIFO_CONSUMER_STORE.init(consumer);
     unsafe { FIFO_CONSUMER = consumer_ref as *mut _ };
 
     // i2s_sine_test(&i2s_peripheral.i2s);
@@ -606,7 +502,6 @@ fn main() -> ! {
         i2s: i2s_peripheral,
         producer: UnsafeCell::new(producer),
         running: AtomicBool::new(false),
-        perf: PerfCounters::default(),
         integrator: AtomicI32::new(0),
     };
 
