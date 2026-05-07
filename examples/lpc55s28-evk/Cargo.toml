@@ -3,6 +3,11 @@ name = "lpc55s28-evk"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["usbhs"]
+usbfs = []
+usbhs = []
+
 [dependencies]
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7.5"
