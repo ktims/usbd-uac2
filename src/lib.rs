@@ -6,18 +6,16 @@ mod cursor;
 pub mod descriptors;
 mod log;
 
-use core::cell::OnceCell;
 use core::cmp::Ordering;
 use core::marker::PhantomData;
 use core::sync::atomic::AtomicUsize;
 
-use byteorder_embedded_io::{LittleEndian, WriteBytesExt};
+use byteorder_embedded_io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use constants::*;
 use descriptors::*;
 use log::*;
 
-use modular_bitfield::prelude::*;
-use num_traits::{ConstZero, Zero};
+use num_traits::ConstZero;
 use usb_device::control::{Recipient, Request, RequestType};
 use usb_device::device::DEFAULT_ALTERNATE_SETTING;
 use usb_device::endpoint::{self, Endpoint, EndpointDirection, In, Out};
@@ -163,7 +161,7 @@ impl UsbIsochronousFeedback {
 pub trait UsbAudioClass<'a, B: UsbBus> {
     /// Called when audio data is received from the host. `ep` is ready for
     /// `ep.read()`.
-    fn audio_data_rx(&self, ep: &Endpoint<'a, B, endpoint::Out>) {}
+    fn audio_data_rx(&mut self, ep: &Endpoint<'a, B, endpoint::Out>) {}
 
     /// Called when it's time to send an isochronous feedback update. Should
     /// return the correct feedback payload. Should not be considered a great
@@ -172,20 +170,14 @@ pub trait UsbAudioClass<'a, B: UsbBus> {
     ///
     /// Required for isochronous asynchronous mode to work properly. If None is
     /// returned, no IN packet will be emitted at feedback time.
-    fn feedback(&self) -> Option<UsbIsochronousFeedback> {
+    fn feedback(&mut self) -> Option<UsbIsochronousFeedback> {
         None
     }
 
     /// Called when the alternate setting of `terminal`'s interface is changed,
     /// before the `AudioStream` is updated. Currently not very useful since we
     /// don't implement alternate settings.
-    fn alternate_setting_changed<CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>(
-        &self,
-        ac: &mut AudioClass<'a, B, CS, AU>,
-        terminal: UsbDirection,
-        alt_setting: u8,
-    ) {
-    }
+    fn alternate_setting_changed(&mut self, terminal: UsbDirection, alt_setting: u8) {}
 }
 
 /// A trait for implementing Sampling Frequency Control for USB Audio Clock Sources
@@ -201,8 +193,8 @@ pub trait UsbAudioClockImpl {
     const SOF_SYNC: bool;
     /// Called when the host requests the current sample rate. Returns the sample rate in Hz.
     fn get_sample_rate(&self) -> core::result::Result<u32, UsbAudioClassError>;
-    /// Called when the host requests to set the sample rate. Should reconfigure the clock source
-    /// if necessary.
+    /// Called when the host requests to set the sample rate. Not necessarily called at all startups,
+    /// so alt_setting should start/stop the clock. Not required for 'fixed' clocks.
     fn set_sample_rate(
         &mut self,
         sample_rate: u32,
@@ -237,6 +229,13 @@ pub trait UsbAudioClockImpl {
     ///
     /// ref: USB Audio Class Specification 2.0 5.2.1 & 5.2.3.3
     fn get_rates(&self) -> core::result::Result<&[RangeEntry<u32>], UsbAudioClassError>;
+
+    /// Called when the audio device's AltSetting is changed. Usually 0 signals shutdown of the
+    /// streaming audio and 1 signals start of streaming. This should be used to start the clock
+    /// (and stop it if desired). If unimplemented, does nothing - keep the clock running at all times.
+    fn alt_setting(&mut self, alt_setting: u8) -> core::result::Result<(), UsbAudioClassError> {
+        Ok(())
+    }
 
     /// Build the ClockSource descriptor. It is not intended to override this method.
     ///
@@ -320,7 +319,7 @@ impl<D: EndpointDirection> TerminalConfig<D> {
         self.format.bytes_per_sample as u32 * self.num_channels as u32
     }
 }
-impl<'a> TerminalConfigurationDescriptors for TerminalConfig<In> {
+impl<'a> TerminalConfigurationDescriptors for TerminalConfig<Out> {
     fn get_configuration_descriptors(&self) -> (InputTerminal, OutputTerminal) {
         let input_terminal = InputTerminal {
             id: self.base_id,
@@ -357,7 +356,7 @@ impl<'a> TerminalConfigurationDescriptors for TerminalConfig<In> {
     // fn get_interface_descriptor(&self, id: InterfaceIndex) )
 }
 
-impl<'a> TerminalConfigurationDescriptors for TerminalConfig<Out> {
+impl<'a> TerminalConfigurationDescriptors for TerminalConfig<In> {
     fn get_configuration_descriptors(&self) -> (InputTerminal, OutputTerminal) {
         let output_terminal = OutputTerminal {
             id: self.base_id,
@@ -422,10 +421,10 @@ pub enum UsbSpeed {
 pub struct AudioClassConfig<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> {
     pub speed: UsbSpeed,
     pub device_category: FunctionCode,
-    pub clock_impl: &'a CS,
-    pub audio_impl: &'a AU,
-    pub input_config: Option<TerminalConfig<Out>>,
-    pub output_config: Option<TerminalConfig<In>>,
+    pub clock_impl: &'a mut CS,
+    pub audio_impl: &'a mut AU,
+    pub input_config: Option<TerminalConfig<In>>,
+    pub output_config: Option<TerminalConfig<Out>>,
     pub additional_descriptors: Option<&'a [AudioClassDescriptor]>,
     _bus: PhantomData<B>,
 }
@@ -436,8 +435,8 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
     pub fn new(
         speed: UsbSpeed,
         device_category: FunctionCode,
-        clock_impl: &'a CS,
-        audio_impl: &'a AU,
+        clock_impl: &'a mut CS,
+        audio_impl: &'a mut AU,
     ) -> Self {
         Self {
             speed,
@@ -450,11 +449,11 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
             _bus: PhantomData,
         }
     }
-    pub fn with_input_config(mut self, input_config: TerminalConfig<Out>) -> Self {
+    pub fn with_input_config(mut self, input_config: TerminalConfig<In>) -> Self {
         self.input_config = Some(input_config);
         self
     }
-    pub fn with_output_config(mut self, output_config: TerminalConfig<In>) -> Self {
+    pub fn with_output_config(mut self, output_config: TerminalConfig<Out>) -> Self {
         self.output_config = Some(output_config);
         self
     }
@@ -516,10 +515,10 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
                 interval,
             );
             let alt_setting = DEFAULT_ALTERNATE_SETTING;
-            ac.in_iface = interface.into();
-            ac.in_ep = endpoint.address().index();
+            ac.out_iface = interface.into();
+            ac.out_ep = endpoint.address().index();
             ac.fb_ep = feedback_ep.address().index();
-            ac.input = Some(AudioStream {
+            ac.output = Some(AudioStream {
                 config,
                 interface,
                 endpoint,
@@ -537,9 +536,10 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
                 interval,
             );
             let alt_setting = DEFAULT_ALTERNATE_SETTING;
-            ac.out_iface = interface.into();
-            ac.out_ep = endpoint.address().index();
-            ac.output = Some(AudioStream {
+            ac.in_iface = interface.into();
+            ac.in_ep = endpoint.address().index();
+
+            ac.input = Some(AudioStream {
                 config,
                 interface,
                 endpoint,
@@ -651,8 +651,8 @@ impl<'a, B: UsbBus, D: EndpointDirection> AudioStream<'a, B, D> {
 
 pub struct AudioClass<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> {
     control_iface: InterfaceNumber,
-    clock_impl: &'a CS,
-    audio_impl: &'a AU,
+    clock_impl: &'a mut CS,
+    audio_impl: &'a mut AU,
     output: Option<AudioStream<'a, B, Out>>,
     input: Option<AudioStream<'a, B, In>>,
     feedback: Option<Endpoint<'a, B, In>>,
@@ -675,7 +675,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
     ) -> usb_device::Result<()> {
         info!("  AudioClass::get_configuration_descriptors");
         // Control + 0-2 streaming
-        let n_interfaces = 1 + (self.input.is_some() as u8) + (self.input.is_some() as u8);
+        let n_interfaces = 1 + (self.input.is_some() as u8) + (self.output.is_some() as u8);
 
         debug!("writer.iad()");
         // UAC2 4.6 Interface Association Descriptor
@@ -835,22 +835,26 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
     fn poll(&mut self) {
         debug!("poll");
         // no streaming in alt 0
-        if self.output.as_ref().unwrap().alt_setting != 1 {
+        if self.output.as_ref().is_none_or(|o| o.alt_setting != 0)
+            || self.input.as_ref().is_none_or(|i| i.alt_setting != 0)
+        {
             return;
         }
         loop {
-            let mut buf = [0; 1024];
-            match self.output.as_ref().unwrap().endpoint.read(&mut buf) {
-                Ok(len) if len > 0 => {
-                    debug!("EP OUT data {:?}", len);
-                }
-                Ok(_) => {
-                    debug!("EP OUT empty");
-                    break;
-                }
-                Err(UsbError::WouldBlock) => break,
-                Err(err) => {
-                    debug!("EP OUT error {:?}", err);
+            if let Some(o) = self.output.as_ref() {
+                let mut buf = [0; 1024];
+                match o.endpoint.read(&mut buf) {
+                    Ok(len) if len > 0 => {
+                        debug!("EP OUT data {:?}", len);
+                    }
+                    Ok(_) => {
+                        debug!("EP OUT empty");
+                        break;
+                    }
+                    Err(UsbError::WouldBlock) => break,
+                    Err(err) => {
+                        debug!("EP OUT error {:?}", err);
+                    }
                 }
             }
         }
@@ -917,16 +921,18 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
         if self.input.is_some() && iface == self.in_iface {
             let old_alt = self.input.as_ref().unwrap().alt_setting;
             if old_alt != alt_setting {
+                self.clock_impl.alt_setting(alt_setting).ok();
                 self.audio_impl
-                    .alternate_setting_changed(self, UsbDirection::In, alt_setting);
+                    .alternate_setting_changed(UsbDirection::In, alt_setting);
                 self.input.as_mut().unwrap().alt_setting = alt_setting;
                 xfer.accept().ok();
             }
         } else if self.output.is_some() && iface == self.out_iface {
             let old_alt = self.output.as_ref().unwrap().alt_setting;
             if old_alt != alt_setting {
+                self.clock_impl.alt_setting(alt_setting).ok();
                 self.audio_impl
-                    .alternate_setting_changed(self, UsbDirection::Out, alt_setting);
+                    .alternate_setting_changed(UsbDirection::Out, alt_setting);
                 self.output.as_mut().unwrap().alt_setting = alt_setting;
                 xfer.accept().ok();
             }
@@ -1023,6 +1029,10 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
         channel: u8,
         control: u8,
     ) {
+        match entity {
+            1 => return self.set_clock_cur(xfer, channel, control),
+            _ => {}
+        }
         debug!("   Unimplemented.");
     }
 
@@ -1131,12 +1141,39 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                     Ok(valid) => {
                         debug!("    {}", valid);
                         buf.write_u8(valid as u8)
-                            .map_err(|_e| UsbError::BufferOverflow)?;
+                            .map_err(|_e| UsbError::BufferOverflow)
+                            .ok();
                         Ok(1)
                     }
                     Err(_e) => Err(UsbError::InvalidState),
                 })
                 .ok();
+            }
+            _ => {
+                debug!("   Unimplemented.");
+            }
+        }
+    }
+    fn set_clock_cur(&mut self, xfer: ControlOut<B>, channel: u8, control: u8) {
+        match control.try_into() {
+            Ok(ClockSourceControlSelector::SamFreqControl) => {
+                debug!("   SamplingFreqControl");
+                if channel != 0 {
+                    error!(
+                        "   Invalid channel {} for SamplingFreqControl GET CUR. Ignoring.",
+                        channel
+                    );
+                }
+                match xfer.data().read_u32::<LittleEndian>() {
+                    Ok(rate) => {
+                        debug!("   SET SamplingFreqControl CUR {}", rate);
+                        self.clock_impl.set_sample_rate(rate).ok();
+                        xfer.accept().ok();
+                    }
+                    Err(e) => {
+                        error!("   SET SamplingFreqControl CUR ERROR BAD DATA");
+                    }
+                }
             }
             _ => {
                 debug!("   Unimplemented.");
