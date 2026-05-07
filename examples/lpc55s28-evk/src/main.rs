@@ -35,7 +35,7 @@ use usbd_uac2::{
     descriptors::{ChannelConfig, ClockType, FormatType1, LockDelay},
 };
 
-// mod wm8904;
+mod wm8904;
 
 struct PllConstants {
     m: u16,   // 1-65535
@@ -100,6 +100,8 @@ const CODEC_I2C_ADDR: u8 = 0b0011010;
 // Fo = 3072/(125*2*8) * 16MHz = 24.576MHz
 const AUDIO_PLL: PllConstants = PllConstants::new(125, 3072, 8);
 const FIFO_LENGTH: usize = 2048; // frames
+const MCLK_FREQ: u32 = 24576000;
+const SAMPLE_RATE: u32 = 48000;
 type SampleType = (i32, i32);
 
 // const SINE_LUT: [i32; 32] = [
@@ -416,62 +418,6 @@ fn init_audio_pll() {
     debug!("pll0 locked after {} tries", i);
 }
 
-// copied from NXP SDK WM8904_Init
-fn init_codec<T>(i2c: &mut T)
-where
-    T: _embedded_hal_blocking_i2c_WriteRead + _embedded_hal_blocking_i2c_Write,
-{
-    let mut buf = [0u8; 2];
-    match i2c.write_read(CODEC_I2C_ADDR, &[0], &mut buf) {
-        Ok(_) => {
-            let chip_id = ((buf[0] as u16) << 8) | buf[1] as u16;
-            defmt::debug!("Read chip ID: {:x}", chip_id)
-        }
-        Err(_) => defmt::error!("Error reading I2C"),
-    }
-
-    i2c.write(CODEC_I2C_ADDR, &[0x16, 0x00, 0x0f]).ok(); // clock rates 2 = OPCLK_ENA | CLK_SYS_ENA | CLK_DSP_ENA | TOCLK_ENA
-    i2c.write(CODEC_I2C_ADDR, &[0x6c, 0x01, 0x00]).ok(); // write sequencer 0 ENA
-    i2c.write(CODEC_I2C_ADDR, &[0x6f, 0x01, 0x00]).ok(); // write sequencer 3 START, INDEX=0
-    // wait on write sequencer
-    defmt::debug!("[codec] waiting on write seq");
-    loop {
-        let mut buf = [0; 2];
-        i2c.write_read(CODEC_I2C_ADDR, &[0x70], &mut buf).ok();
-        if buf[1] & 1 == 0 {
-            break;
-        }
-    }
-    defmt::debug!("[codec] write seq done");
-    i2c.write(CODEC_I2C_ADDR, &[0x14, 0x00, 0x00]).ok(); // clock rates 0
-    i2c.write(CODEC_I2C_ADDR, &[0x0c, 0x00, 0x03]).ok(); // power management 0 = INL_ENA | INR_ENA
-    i2c.write(CODEC_I2C_ADDR, &[0x0e, 0x00, 0x03]).ok(); // power management 2 = HPL_PGA_ENA | HPR_PGA_ENA
-    i2c.write(CODEC_I2C_ADDR, &[0x0f, 0x00, 0x03]).ok(); // power management 3 = LINEOUTL_ENA | LINEOUTR_ENA
-
-    i2c.write(CODEC_I2C_ADDR, &[0x12, 0x00, 0x0f]).ok(); // power management 6 = DACL_ENA | DACR_ENA | ADCL_ENA | ADCR_ENA
-    i2c.write(CODEC_I2C_ADDR, &[0x0a, 0x00, 0x01]).ok(); // analog adc 0 = ADC_OSR128
-    i2c.write(CODEC_I2C_ADDR, &[0x18, 0x00, 0x50]).ok(); // audio if 0 = AIFADCR_SRC | AIFDACR_SRC
-    i2c.write(CODEC_I2C_ADDR, &[0x21, 0x00, 0x40]).ok(); // dac digital 1 = DAC_OSR128
-    i2c.write(CODEC_I2C_ADDR, &[0x2c, 0x00, 0x05]).ok(); // analog lin 0 = 0dB (unmute)
-    i2c.write(CODEC_I2C_ADDR, &[0x2d, 0x00, 0x05]).ok(); // analog rin 0 = 0dB (unmute)
-    i2c.write(CODEC_I2C_ADDR, &[0x39, 0x00, 0x39]).ok(); // analog out1 left = vol=0dB
-    i2c.write(CODEC_I2C_ADDR, &[0x3a, 0x00, 0x39]).ok(); // analog out1 right = vol=0dB
-    i2c.write(CODEC_I2C_ADDR, &[0x3b, 0x00, 0x39]).ok(); // analog out2 left = vol=0dB
-    i2c.write(CODEC_I2C_ADDR, &[0x3c, 0x00, 0x39]).ok(); // analog out2 right = vol=0dB
-    i2c.write(CODEC_I2C_ADDR, &[0x43, 0x00, 0x03]).ok(); // dc server 0 = HPOUTL_ENA | HPOUTR_ENA
-    i2c.write(CODEC_I2C_ADDR, &[0x5a, 0x00, 0xff]).ok(); // analog hp 0 = remove all shorts etc
-    i2c.write(CODEC_I2C_ADDR, &[0x5e, 0x00, 0xff]).ok(); // analog lineout 0 = remove all shorts etc
-    i2c.write(CODEC_I2C_ADDR, &[0x68, 0x00, 0x01]).ok(); // enable class w charge pump
-    i2c.write(CODEC_I2C_ADDR, &[0x62, 0x00, 0x01]).ok(); // enable charge pump
-    i2c.write(CODEC_I2C_ADDR, &[0x19, 0x00, 0x0e]).ok(); // audio if 1 = i2s, 32 bits mode
-    i2c.write(CODEC_I2C_ADDR, &[0x15, (0x05 << 2), 0x05]).ok(); // sys clock rate 512fs, sample rate 48
-    i2c.write(CODEC_I2C_ADDR, &[0x16, 0x00, 0x0f]).ok(); // clock rates 2 = CLK_SYS_ENA
-    i2c.write(CODEC_I2C_ADDR, &[0x1a, 0x00, 0x08]).ok(); // audio interface 2 = no gpio, sysclk / 8
-    i2c.write(CODEC_I2C_ADDR, &[0x1b, 0x00, 0x00]).ok(); // audio interface 3 = input lrclock
-    i2c.write(CODEC_I2C_ADDR, &[0x3d, 0x00, 0x00]).ok(); // analog out12 zc = play source = dac
-    i2c.write(CODEC_I2C_ADDR, &[0x1e, 0x01, 0xff]).ok(); // dac vol left = update left/right = 0dB
-}
-
 pub struct I2sTx {
     pub i2s: pac::I2S7,
 }
@@ -644,7 +590,7 @@ fn main() -> ! {
     let clock = Clock {};
 
     defmt::debug!("codec init");
-    init_codec(&mut i2c_bus);
+    wm8904::init_codec(&mut i2c_bus);
     let queue = cortex_m::singleton!(
         : heapless::spsc::Queue<SampleType, FIFO_LENGTH>
         = heapless::spsc::Queue::new()
