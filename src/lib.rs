@@ -8,7 +8,6 @@ mod log;
 
 use core::cmp::Ordering;
 use core::marker::PhantomData;
-use core::sync::atomic::AtomicUsize;
 
 use byteorder_embedded_io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use constants::*;
@@ -20,8 +19,6 @@ use usb_device::control::{Recipient, Request, RequestType};
 use usb_device::device::DEFAULT_ALTERNATE_SETTING;
 use usb_device::endpoint::{self, Endpoint, EndpointDirection, In, Out};
 use usb_device::{UsbDirection, class_prelude::*};
-
-pub use constants::USB_CLASS_AUDIO;
 
 #[cfg(feature = "defmt")]
 use defmt;
@@ -66,6 +63,9 @@ impl RangeType for u8 {}
 impl RangeType for u16 {}
 impl RangeType for u32 {}
 
+/// Represent a range request/response.
+///
+/// ref: UAC2 5.2.2
 #[derive(PartialEq, Eq, Ord)]
 pub struct RangeEntry<T: RangeType> {
     pub min: T,
@@ -85,10 +85,7 @@ impl<T: RangeType> RangeEntry<T> {
         }
     }
 
-    pub fn write<W: embedded_io::Write>(
-        &self,
-        mut buf: W,
-    ) -> core::result::Result<usize, W::Error> {
+    fn write<W: embedded_io::Write>(&self, mut buf: W) -> core::result::Result<usize, W::Error> {
         buf.write_all(self.min.to_le_bytes().as_ref())?;
         buf.write_all(self.max.to_le_bytes().as_ref())?;
         buf.write_all(self.res.to_le_bytes().as_ref())?;
@@ -96,52 +93,42 @@ impl<T: RangeType> RangeEntry<T> {
     }
 }
 
-/// The spec guarantees that ranges do not overlap, so compare by min is correct.
+// The spec guarantees that ranges do not overlap, so compare by min is correct.
 impl<T: RangeType + PartialOrd> PartialOrd for RangeEntry<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.min.partial_cmp(&other.min)
     }
 }
 
-/// Fixed point 10.14, packed to the least significant 3-bytes of a 4-byte USB feedback endpoint response
+/// Represent Isochronous feedback as integer and fractional parts, internally as 16.16.
+///
+/// Provides conversions to and from the different USB formats.
 #[derive(Copy, Clone)]
-pub struct UsbIsochronousFeedback {
-    pub int: u16,
-    pub frac: u16,
-}
+pub struct UsbIsochronousFeedback(u32);
 
 impl UsbIsochronousFeedback {
+    pub fn new(v: u32) -> Self {
+        Self(v)
+    }
     /// Accepts all u16 values, saturating the output depending on format
     pub fn new_frac(int: u16, frac: u16) -> Self {
-        Self { int, frac }
+        Self(((int as u32) << 16) | frac as u32)
     }
+    /// Convert float to fixed point
     pub fn new_float(rate: f32) -> Self {
         let fb = (rate * 65536.0 + 0.5) as u32;
-        Self::new(fb)
+        Self(fb)
     }
-    /// Assumed 16.16, not either of the USB formats
-    pub fn new(value: u32) -> Self {
-        Self {
-            int: (value >> 16) as u16,
-            frac: (value & 0xffff) as u16,
-        }
+    pub fn parts(&self) -> (u16, u16) {
+        ((self.0 >> 16) as u16, (self.0 & 0xffff) as u16)
     }
     /// Serialize into a u32 in 16.16 representation for USB HS
     pub fn to_u32_12_13(&self) -> u32 {
-        let int = (self.int as u32) << 16;
-        // ostensibly 13 bits, so should require << 3, but USB allows us to use
-        // these bits for 'extra precision'. So we may as well just treat it as
-        // 16.16. The application can << 3 if it wants to for some reason.
-        let frac = (self.frac as u32) & 0xffff;
-
-        int | frac
+        self.0
     }
-    /// Serialize into a u32 in 10.14 representation for USB FS (take the 3 LSB)
+    /// Serialize into a u32 in 10.14 representation for USB FS
     pub fn to_u32_10_14(&self) -> u32 {
-        let int = (self.int as u32) << 14;
-        let frac = (self.frac as u32) & 0x3fff;
-
-        int | frac
+        (self.0 + 2) >> 2
     }
     /// Serialize into 16.16 little endian byte array for USB HS
     pub fn to_bytes_12_13(&self) -> [u8; 4] {
@@ -156,16 +143,11 @@ impl UsbIsochronousFeedback {
 
 /// A trait for implementing USB Audio Class 2 devices
 ///
-/// Contains callback methods which will be called by the class driver. All
-/// callbacks are optional, which may be useful for a tight-loop polling implementation
-/// but most implementations will want to implement at least `audio_data_rx`.
-///
-/// Unimplemented callbacks should return `Ok(())` if a result is required.
-
-pub trait UsbAudioClass<'a, B: UsbBus> {
+/// Contains callback methods which will be called by the class driver.
+pub trait AudioHandler<'a, B: UsbBus> {
     /// Called when audio data is received from the host. `ep` is ready for
     /// `ep.read()`.
-    fn audio_data_rx(&mut self, ep: &Endpoint<'a, B, endpoint::Out>) {}
+    fn audio_data_rx(&mut self, ep: &Endpoint<'a, B, endpoint::Out>);
 
     /// Called when it's time to send an isochronous feedback update. Should
     /// return the correct feedback payload. Feedback always runs at 1ms (in
@@ -173,14 +155,15 @@ pub trait UsbAudioClass<'a, B: UsbBus> {
     ///
     /// Required for isochronous asynchronous mode to work properly. If None is
     /// returned, no IN packet will be emitted at feedback time.
-    fn feedback(&mut self, nominal_rate: UsbIsochronousFeedback) -> Option<UsbIsochronousFeedback> {
-        None
-    }
+    fn feedback(&mut self, nominal: UsbIsochronousFeedback) -> Option<UsbIsochronousFeedback>;
 
     /// Called when the alternate setting of `terminal`'s interface is changed,
-    /// before the `AudioStream` is updated. Currently not very useful since we
-    /// don't implement alternate settings.
-    fn alternate_setting_changed(&mut self, terminal: UsbDirection, alt_setting: u8) {}
+    /// before the `AudioStream` is updated. This is how the host signals start/stop
+    /// of audio streaming. We do not expect audio frames when alt setting is 0.
+    ///
+    /// The implementation will also call `alternate_setting_changed(_, 0)` when
+    /// the host disconnects / resets.
+    fn alternate_setting_changed(&mut self, terminal: UsbDirection, alt_setting: u8);
 }
 
 /// A trait for implementing Sampling Frequency Control for USB Audio Clock Sources
@@ -191,7 +174,7 @@ pub trait UsbAudioClass<'a, B: UsbBus> {
 /// Unimplemented callbacks should return `Err(UsbAudioClassError::NotImplemented)`. Other
 /// errors will panic (the underlying callbacks are not fallible). If you need to handle errors,
 /// you should use the callback to infalliably signal another task.
-pub trait UsbAudioClockImpl {
+pub trait ClockSource {
     const CLOCK_TYPE: ClockType;
     const SOF_SYNC: bool;
     /// Called when the host or class needs the current sample rate. Returns the
@@ -200,7 +183,7 @@ pub trait UsbAudioClockImpl {
     ///
     /// Should never return 0 as it may be used in divides in the feedback loop
     /// and that would cause a hard fault.
-    fn get_sample_rate(&self) -> u32;
+    fn sample_rate(&self) -> u32;
     /// Called when the host requests to set the sample rate. Not necessarily called at all startups,
     /// so alt_setting should start/stop the clock. Not required for 'fixed' clocks.
     fn set_sample_rate(
@@ -211,14 +194,14 @@ pub trait UsbAudioClockImpl {
     }
     /// Called when the host requests to get the clock validity. Returns `true`
     /// if the clock is stable and on frequency.
-    fn get_clock_validity(&self) -> core::result::Result<bool, UsbAudioClassError> {
+    fn clock_validity(&self) -> core::result::Result<bool, UsbAudioClassError> {
         Err(UsbAudioClassError::NotImplemented)
     }
     /// Called during descriptor construction to describe if the clock validity can be read (write is not valid).
     ///
     /// By default will call `get_clock_validity` to determine if the clock validity can be read.
-    fn get_validity_access(&self) -> core::result::Result<bool, UsbAudioClassError> {
-        match self.get_clock_validity() {
+    fn clock_validity_access(&self) -> core::result::Result<bool, UsbAudioClassError> {
+        match self.clock_validity() {
             Ok(_) => Ok(true),
             Err(UsbAudioClassError::NotImplemented) => Ok(false),
             Err(err) => Err(err),
@@ -236,35 +219,29 @@ pub trait UsbAudioClockImpl {
     ///     its MIN and MAX subattribute and the RES subattribute must be set to zero
     ///
     /// ref: USB Audio Class Specification 2.0 5.2.1 & 5.2.3.3
-    fn get_rates(&self) -> core::result::Result<&[RangeEntry<u32>], UsbAudioClassError>;
+    fn sample_rates(&self) -> core::result::Result<&[RangeEntry<u32>], UsbAudioClassError>;
 
-    /// Called when the audio device's AltSetting is changed. Usually 0 signals shutdown of the
-    /// streaming audio and 1 signals start of streaming. This should be used to start the clock
-    /// (and stop it if desired). If unimplemented, does nothing - keep the clock running at all times.
-    fn alt_setting(&mut self, alt_setting: u8) -> core::result::Result<(), UsbAudioClassError> {
-        Ok(())
-    }
-
-    /// Build the ClockSource descriptor. It is not intended to override this method.
+    /// Build the ClockSource descriptor. It is not intended to override this
+    /// method, but provided so you can.
     ///
     /// Assumes access control based on clock type. Internal fixed/variable are read only,
     /// external and internal programmable are programmable.
-    fn get_configuration_descriptor(
+    fn clock_configuration_descriptor(
         &self,
         id: u8,
         string: Option<StringIndex>,
-    ) -> usb_device::Result<ClockSource> {
+    ) -> usb_device::Result<descriptors::ClockSource> {
         let frequency_access = match Self::CLOCK_TYPE {
             ClockType::InternalFixed | ClockType::InternalVariable => AccessControl::ReadOnly,
             ClockType::External | ClockType::InternalProgrammable => AccessControl::Programmable,
         };
-        let validity_access = match self.get_validity_access() {
+        let validity_access = match self.clock_validity_access() {
             Ok(true) => AccessControl::ReadOnly,
             Ok(false) | Err(UsbAudioClassError::NotImplemented) => AccessControl::NotPresent,
             _ => return Err(UsbError::Unsupported),
         };
 
-        let cs = ClockSource {
+        let cs = descriptors::ClockSource {
             id: id,
             clock_type: Self::CLOCK_TYPE,
             sof_sync: Self::SOF_SYNC,
@@ -282,6 +259,102 @@ trait TerminalConfigurationDescriptors {
     fn get_configuration_descriptors(&self) -> (InputTerminal, OutputTerminal);
 }
 
+pub struct TerminalConfigBuilder<D: EndpointDirection> {
+    base_id: Option<u8>,
+    clock_source_id: Option<u8>,
+    num_channels: Option<u8>,
+    format: Option<FormatType1>,
+    terminal_type: Option<TerminalType>,
+    channel_config: Option<ChannelConfig>,
+    sync_type: Option<IsochronousSynchronizationType>,
+    lock_delay: Option<LockDelay>,
+    string: Option<StringIndex>,
+    _direction: PhantomData<D>,
+}
+
+// Global builder initialization defaults
+impl<D: EndpointDirection> TerminalConfigBuilder<D> {
+    fn new() -> Self {
+        Self {
+            base_id: None,
+            clock_source_id: None,
+            num_channels: None,
+            format: None,
+            terminal_type: None,
+            channel_config: None,
+            sync_type: None,
+            lock_delay: None,
+            string: None,
+            _direction: PhantomData,
+        }
+    }
+
+    pub fn base_id(mut self, id: u8) -> Self {
+        self.base_id = Some(id);
+        self
+    }
+
+    pub fn clock_source_id(mut self, id: u8) -> Self {
+        self.clock_source_id = Some(id);
+        self
+    }
+
+    pub fn num_channels(mut self, channels: u8) -> Self {
+        self.num_channels = Some(channels);
+        self
+    }
+
+    pub fn format(mut self, format: FormatType1) -> Self {
+        self.format = Some(format);
+        self
+    }
+
+    pub fn terminal_type(mut self, t: TerminalType) -> Self {
+        self.terminal_type = Some(t);
+        self
+    }
+
+    pub fn channel_config(mut self, config: ChannelConfig) -> Self {
+        self.channel_config = Some(config);
+        self
+    }
+
+    pub fn sync_type(mut self, sync: IsochronousSynchronizationType) -> Self {
+        self.sync_type = Some(sync);
+        self
+    }
+
+    pub fn lock_delay(mut self, delay: LockDelay) -> Self {
+        self.lock_delay = Some(delay);
+        self
+    }
+
+    pub fn string(mut self, index: StringIndex) -> Self {
+        self.string = Some(index);
+        self
+    }
+
+    pub fn build(self) -> TerminalConfig<D> {
+        TerminalConfig {
+            base_id: self.base_id.expect("base_id is required"),
+            clock_source_id: self.clock_source_id.unwrap_or(1),
+            num_channels: self.num_channels.unwrap_or(2),
+            format: self.format.unwrap_or(FormatType1 {
+                bytes_per_sample: 4,
+                bit_resolution: 32,
+            }),
+            terminal_type: self.terminal_type.unwrap_or(TerminalType::ExtUndefined),
+            channel_config: self
+                .channel_config
+                .unwrap_or(ChannelConfig::default_chans(self.num_channels.unwrap_or(2))),
+            sync_type: IsochronousSynchronizationType::Asynchronous,
+            lock_delay: LockDelay::Undefined(0),
+            string: self.string, // Implicitly handles None or Option mapping
+            _direction: PhantomData,
+        }
+    }
+}
+
 pub struct TerminalConfig<D: EndpointDirection> {
     /// USB terminal in the D direction will have this id, audio terminal will have this id + 1
     base_id: u8,
@@ -296,9 +369,8 @@ pub struct TerminalConfig<D: EndpointDirection> {
     _direction: PhantomData<D>,
 }
 
-// TODO: builder pattern
 impl<D: EndpointDirection> TerminalConfig<D> {
-    pub fn new(
+    fn new(
         base_id: u8,
         clock_source_id: u8,
         num_channels: u8,
@@ -325,6 +397,10 @@ impl<D: EndpointDirection> TerminalConfig<D> {
     // Bytes per audio frame
     pub fn bytes_per_frame(&self) -> u32 {
         self.format.bytes_per_sample as u32 * self.num_channels as u32
+    }
+
+    pub fn builder() -> TerminalConfigBuilder<D> {
+        TerminalConfigBuilder::new()
     }
 }
 impl<'a> TerminalConfigurationDescriptors for TerminalConfig<Out> {
@@ -426,10 +502,9 @@ pub enum UsbSpeed {
 /// A single Clock Source is always required, but a fully custom descriptor set can be built by only providing
 /// the Clock Source and additional descriptors, if the Terminal descriptors are inappropriate.
 ///
-pub struct AudioClassConfig<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> {
+pub struct UsbAudioClassConfig<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> {
     pub speed: UsbSpeed,
     pub device_category: FunctionCode,
-    pub clock_impl: &'a mut CS,
     pub audio_impl: &'a mut AU,
     pub input_config: Option<TerminalConfig<In>>,
     pub output_config: Option<TerminalConfig<Out>>,
@@ -437,19 +512,11 @@ pub struct AudioClassConfig<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioCl
     _bus: PhantomData<B>,
 }
 
-impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
-    AudioClassConfig<'a, B, CS, AU>
-{
-    pub fn new(
-        speed: UsbSpeed,
-        device_category: FunctionCode,
-        clock_impl: &'a mut CS,
-        audio_impl: &'a mut AU,
-    ) -> Self {
+impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClassConfig<'a, B, AU> {
+    pub fn new(speed: UsbSpeed, device_category: FunctionCode, audio_impl: &'a mut AU) -> Self {
         Self {
             speed,
             device_category,
-            clock_impl,
             audio_impl,
             input_config: None,
             output_config: None,
@@ -474,7 +541,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
     }
 
     /// Allocate the various USB IDs, and build the class implementation
-    pub fn build(self, alloc: &'a UsbBusAllocator<B>) -> Result<AudioClass<'a, B, CS, AU>> {
+    pub fn build(self, alloc: &'a UsbBusAllocator<B>) -> Result<UsbAudioClass<'a, B, AU>> {
         let speed = self.speed;
         let (interval, fb_interval, audio_rate) = match speed {
             UsbSpeed::Full => (1, 1, 1000),
@@ -482,8 +549,8 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
             UsbSpeed::Low => return Err(Error::InvalidSpeed),
         };
         let max_rate = self
-            .clock_impl
-            .get_rates()
+            .audio_impl
+            .sample_rates()
             .unwrap()
             .iter()
             .max()
@@ -492,12 +559,11 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
         let control_iface = alloc.interface();
 
         let nominal_fb = UsbIsochronousFeedback::new_float(
-            self.clock_impl.get_sample_rate().to_f32().unwrap() / audio_rate.to_f32().unwrap(),
+            self.audio_impl.sample_rate().to_f32().unwrap() / audio_rate.to_f32().unwrap(),
         );
 
-        let mut ac = AudioClass {
+        let mut ac = UsbAudioClass {
             control_iface,
-            clock_impl: self.clock_impl,
             audio_impl: self.audio_impl,
             output: None,
             input: None,
@@ -663,9 +729,8 @@ impl<'a, B: UsbBus, D: EndpointDirection> AudioStream<'a, B, D> {
     }
 }
 
-pub struct AudioClass<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> {
+pub struct UsbAudioClass<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> {
     control_iface: InterfaceNumber,
-    clock_impl: &'a mut CS,
     audio_impl: &'a mut AU,
     output: Option<AudioStream<'a, B, Out>>,
     input: Option<AudioStream<'a, B, In>>,
@@ -682,8 +747,8 @@ pub struct AudioClass<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a
     audio_rate: u32, // audio packet rate in hz
 }
 
-impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
-    for AudioClass<'a, B, CS, AU>
+impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbClass<B>
+    for UsbAudioClass<'a, B, AU>
 {
     fn get_configuration_descriptors(
         &self,
@@ -715,7 +780,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
 
         // BUILD CONFIGURATION DESCRIPTORS //
         let mut total_length: u16 = 9; // HEADER
-        let clock_desc = self.clock_impl.get_configuration_descriptor(1, None)?;
+        let clock_desc = self.audio_impl.clock_configuration_descriptor(1, None)?;
         total_length += clock_desc.size() as u16;
         let output_descs = match &self.output {
             Some(stream) => {
@@ -867,9 +932,17 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
             }
         }
     }
+
+    fn reset(&mut self) {
+        defmt::info!("usb reset");
+        self.audio_impl
+            .alternate_setting_changed(UsbDirection::In, 0);
+        self.audio_impl
+            .alternate_setting_changed(UsbDirection::Out, 0);
+    }
 }
 
-impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<'a, B, CS, AU> {
+impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, AU> {
     fn emit_feedback(&mut self) {
         if let Some(fb_ep) = self.feedback.as_ref() {
             if let Some(fb) = self.audio_impl.feedback(self.nominal_fb) {
@@ -945,7 +1018,6 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
         if self.input.is_some() && iface == self.in_iface {
             let old_alt = self.input.as_ref().unwrap().alt_setting;
             if old_alt != alt_setting {
-                self.clock_impl.alt_setting(alt_setting).ok();
                 self.audio_impl
                     .alternate_setting_changed(UsbDirection::In, alt_setting);
                 self.input.as_mut().unwrap().alt_setting = alt_setting;
@@ -954,7 +1026,6 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
         } else if self.output.is_some() && iface == self.out_iface {
             let old_alt = self.output.as_ref().unwrap().alt_setting;
             if old_alt != alt_setting {
-                self.clock_impl.alt_setting(alt_setting).ok();
                 self.audio_impl
                     .alternate_setting_changed(UsbDirection::Out, alt_setting);
                 // Start the IN cycle running
@@ -1145,7 +1216,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                     );
                 }
                 xfer.accept(|mut buf| {
-                    let rate = self.clock_impl.get_sample_rate();
+                    let rate = self.audio_impl.sample_rate();
 
                     debug!("    {}", rate);
                     buf.write_u32::<LittleEndian>(rate)
@@ -1162,7 +1233,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                         channel
                     );
                 }
-                xfer.accept(|mut buf| match self.clock_impl.get_clock_validity() {
+                xfer.accept(|mut buf| match self.audio_impl.clock_validity() {
                     Ok(valid) => {
                         debug!("    {}", valid);
                         buf.write_u8(valid as u8)
@@ -1192,7 +1263,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                 match xfer.data().read_u32::<LittleEndian>() {
                     Ok(rate) => {
                         debug!("   SET SamplingFreqControl CUR {}", rate);
-                        self.clock_impl.set_sample_rate(rate).ok();
+                        self.audio_impl.set_sample_rate(rate).ok();
                         self.nominal_fb = UsbIsochronousFeedback::new_float(
                             rate.to_f32().unwrap() / self.audio_rate.to_f32().unwrap(),
                         );
@@ -1218,7 +1289,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                         channel
                     );
                 }
-                xfer.accept(|mut buf| match self.clock_impl.get_rates() {
+                xfer.accept(|mut buf| match self.audio_impl.sample_rates() {
                     Ok(rates) => {
                         buf.write_u16::<LittleEndian>(rates.len() as u16)
                             .map_err(|_e| UsbError::BufferOverflow)?;
