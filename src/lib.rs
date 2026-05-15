@@ -821,36 +821,22 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
     }
     fn endpoint_out(&mut self, addr: EndpointAddress) {
         debug!("EP {} out data", addr);
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
         if addr.index() == self.out_ep {
             self.audio_impl
                 .audio_data_rx(&self.output.as_ref().unwrap().endpoint);
-            let new_count = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-            if let Some(fb_ep) = self.feedback.as_ref() {
-                if new_count.is_multiple_of(1 << (fb_ep.interval() - 1) as usize) {
-                    let cur_rate = self.clock_impl.get_sample_rate();
-                    let numerator = (cur_rate as u64) << 16;
-                    let raw = (numerator + self.audio_rate as u64 / 2) / (self.audio_rate as u64);
-                    let nominal_rate = UsbIsochronousFeedback {
-                        int: (raw >> 16) as u16,
-                        frac: (raw & 0xffff) as u16,
-                    };
-
-                    if let Some(fb) = self.audio_impl.feedback(nominal_rate) {
-                        debug!("  emitting feedback IN {:08x}", fb.to_u32_12_13());
-                        let r = match self.speed {
-                            UsbSpeed::Low | UsbSpeed::Full => fb_ep.write(&fb.to_bytes_10_14()),
-                            UsbSpeed::High | UsbSpeed::Super => fb_ep.write(&fb.to_bytes_12_13()),
-                        };
-                        if let Err(e) = r {
-                            warn!("  feedback IN failed {:?}", e);
-                        }
-                    }
-                }
-            }
         } else {
             debug!("  unexpected OUT on {}", addr);
+        }
+    }
+
+    fn endpoint_in_complete(&mut self, addr: EndpointAddress) {
+        debug!("EP {} IN complete", addr);
+        if let Some(fb_ep) = self.feedback.as_ref()
+            && addr.index() == self.fb_ep
+        {
+            self.emit_feedback();
+        } else {
+            debug!("  unexpected IN on {}", addr);
         }
     }
 
@@ -884,6 +870,22 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> UsbClass<B>
 }
 
 impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<'a, B, CS, AU> {
+    fn emit_feedback(&mut self) {
+        if let Some(fb_ep) = self.feedback.as_ref() {
+            if let Some(fb) = self.audio_impl.feedback(self.nominal_fb) {
+                debug!("  emitting feedback IN {:08x}", fb.to_u32_12_13());
+                let r = match self.speed {
+                    UsbSpeed::Low | UsbSpeed::Full => fb_ep.write(&fb.to_bytes_10_14()),
+                    UsbSpeed::High | UsbSpeed::Super => fb_ep.write(&fb.to_bytes_12_13()),
+                };
+                if let Err(e) = r {
+                    warn!("  feedback IN failed {:?}", e);
+                }
+            } else {
+                debug!("  feedback callback returned None")
+            }
+        }
+    }
     fn standard_request_out(&mut self, xfer: ControlOut<B>) {
         let req = xfer.request();
         match (req.recipient, req.request) {
@@ -955,6 +957,8 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                 self.clock_impl.alt_setting(alt_setting).ok();
                 self.audio_impl
                     .alternate_setting_changed(UsbDirection::Out, alt_setting);
+                // Start the IN cycle running
+                self.emit_feedback();
                 self.output.as_mut().unwrap().alt_setting = alt_setting;
                 xfer.accept().ok();
             }
