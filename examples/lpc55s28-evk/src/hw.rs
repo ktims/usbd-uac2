@@ -1,8 +1,19 @@
 //! Contains hardware setup unrelated to Usb Audio Class implementation
 
 use crate::Syscon;
+use crate::hal;
 use crate::{MCLK_FREQ, SAMPLE_RATE, pac};
+
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use defmt::debug;
+use hal::{
+    Enabled, Iocon, Pin,
+    drivers::pins,
+    traits::wg::digital::v2::{OutputPin, ToggleableOutputPin},
+    typestates::pin::{gpio::direction::Output, state::Gpio},
+};
+
 pub(crate) struct PllConstants {
     pub m: u16,   // 1-65535
     pub n: u8,    // 1-255
@@ -79,7 +90,7 @@ pub(crate) fn init_audio_pll() {
         .xo32m_ctrl
         .modify(|_, w| w.enable_system_clk_out().enable());
 
-    debug!("init pll: {}", AUDIO_PLL);
+    debug!("init pll0: {}", AUDIO_PLL);
     pmc.pdruncfg0
         .modify(|_, w| w.pden_pll0().poweredoff().pden_pll0_sscg().poweredoff());
     syscon.pll0clksel.write(|w| w.sel().enum_0x1()); // clk_in
@@ -223,4 +234,75 @@ pub fn init_i2s(mut fc7: pac::FLEXCOMM7, i2s7: pac::I2S7, syscon: &mut Syscon) -
     });
 
     I2sTx { i2s: regs }
+}
+
+pub struct SharedLed<T: OutputPin> {
+    inner: UnsafeCell<T>,
+}
+unsafe impl<T: OutputPin> Sync for SharedLed<T> {}
+impl<T: OutputPin> SharedLed<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner: UnsafeCell::new(inner),
+        }
+    }
+    pub fn on(&self) {
+        unsafe {
+            (*self.inner.get()).set_low().ok();
+        }
+    }
+    pub fn off(&self) {
+        unsafe {
+            (*self.inner.get()).set_high().ok();
+        }
+    }
+}
+impl<T: OutputPin + ToggleableOutputPin> SharedLed<T> {
+    pub fn toggle(&self) {
+        unsafe {
+            (*self.inner.get()).toggle().ok();
+        }
+    }
+}
+
+type RedLed = Pin<pins::Pio1_6, Gpio<Output>>;
+type GreenLed = Pin<pins::Pio1_7, Gpio<Output>>;
+type BlueLed = Pin<pins::Pio1_4, Gpio<Output>>;
+pub static RED_LED: MaybeUninit<SharedLed<RedLed>> = MaybeUninit::uninit();
+pub static GREEN_LED: MaybeUninit<SharedLed<GreenLed>> = MaybeUninit::uninit();
+pub static BLUE_LED: MaybeUninit<SharedLed<BlueLed>> = MaybeUninit::uninit();
+
+pub fn init_leds(iocon: &mut Iocon<Enabled>, gpio: &mut hal::Gpio<Enabled>) {
+    let red_led = SharedLed::new(
+        pins::Pio1_6::take()
+            .unwrap()
+            .into_gpio_pin(iocon, gpio)
+            .into_output_low(),
+    );
+    let green_led = SharedLed::new(
+        pins::Pio1_7::take()
+            .unwrap()
+            .into_gpio_pin(iocon, gpio)
+            .into_output_low(),
+    );
+    let blue_led = SharedLed::new(
+        pins::Pio1_4::take()
+            .unwrap()
+            .into_gpio_pin(iocon, gpio)
+            .into_output_low(),
+    );
+    unsafe {
+        core::ptr::write(RED_LED.as_ptr() as *mut SharedLed<RedLed>, red_led);
+        core::ptr::write(GREEN_LED.as_ptr() as *mut SharedLed<GreenLed>, green_led);
+        core::ptr::write(BLUE_LED.as_ptr() as *mut SharedLed<BlueLed>, blue_led);
+    }
+}
+pub fn red_led() -> &'static SharedLed<RedLed> {
+    unsafe { &*RED_LED.as_ptr() }
+}
+pub fn green_led() -> &'static SharedLed<GreenLed> {
+    unsafe { &*GREEN_LED.as_ptr() }
+}
+pub fn blue_led() -> &'static SharedLed<BlueLed> {
+    unsafe { &*BLUE_LED.as_ptr() }
 }

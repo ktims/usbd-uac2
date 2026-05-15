@@ -9,13 +9,13 @@ usbfs = []
 usbhs = []
 
 [dependencies]
+bbqueue = "0.7.0"
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7.5"
 defmt = "1.0.1"
 defmt-rtt = "1.1.0"
 embedded-hal = "1.0.0"
 embedded-io = "0.7.1"
-heapless = "0.9.3"
 log-to-defmt = "0.1.0"
 lpc55-hal = { version = "0.5.0", path = "../lpc55-hal" }
 nb = "1.1.0"
