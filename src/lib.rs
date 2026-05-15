@@ -15,7 +15,7 @@ use constants::*;
 use descriptors::*;
 use log::*;
 
-use num_traits::ConstZero;
+use num_traits::{ConstZero, ToPrimitive};
 use usb_device::control::{Recipient, Request, RequestType};
 use usb_device::device::DEFAULT_ALTERNATE_SETTING;
 use usb_device::endpoint::{self, Endpoint, EndpointDirection, In, Out};
@@ -114,6 +114,10 @@ impl UsbIsochronousFeedback {
     /// Accepts all u16 values, saturating the output depending on format
     pub fn new_frac(int: u16, frac: u16) -> Self {
         Self { int, frac }
+    }
+    pub fn new_float(rate: f32) -> Self {
+        let fb = (rate * 65536.0 + 0.5) as u32;
+        Self::new(fb)
     }
     /// Assumed 16.16, not either of the USB formats
     pub fn new(value: u32) -> Self {
@@ -487,6 +491,10 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
             .max;
         let control_iface = alloc.interface();
 
+        let nominal_fb = UsbIsochronousFeedback::new_float(
+            self.clock_impl.get_sample_rate().to_f32().unwrap() / audio_rate.to_f32().unwrap(),
+        );
+
         let mut ac = AudioClass {
             control_iface,
             clock_impl: self.clock_impl,
@@ -502,6 +510,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
             out_ep: 0,
             fb_ep: 0,
             speed,
+            nominal_fb,
             audio_rate,
         };
 
@@ -510,7 +519,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
             let endpoint = alloc.isochronous(
                 config.sync_type,
                 IsochronousUsageType::Data,
-                (max_rate.div_ceil(audio_rate) * config.bytes_per_frame()) as u16,
+                ((max_rate.div_ceil(audio_rate) + 1) * config.bytes_per_frame()) as u16, // headroom of 1 sample for rate control
                 interval,
             );
             let feedback_ep = alloc.isochronous(
@@ -537,7 +546,7 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>>
             let endpoint = alloc.isochronous(
                 config.sync_type,
                 IsochronousUsageType::Data,
-                (max_rate.div_ceil(audio_rate) * config.bytes_per_frame()) as u16,
+                ((max_rate.div_ceil(audio_rate) + 1) * config.bytes_per_frame()) as u16, // headroom of 1 sample for rate control
                 interval,
             );
             let alt_setting = DEFAULT_ALTERNATE_SETTING;
@@ -669,6 +678,7 @@ pub struct AudioClass<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a
     out_ep: usize,
     fb_ep: usize,
     speed: UsbSpeed,
+    nominal_fb: UsbIsochronousFeedback,
     audio_rate: u32, // audio packet rate in hz
 }
 
@@ -1179,6 +1189,9 @@ impl<'a, B: UsbBus, CS: UsbAudioClockImpl, AU: UsbAudioClass<'a, B>> AudioClass<
                     Ok(rate) => {
                         debug!("   SET SamplingFreqControl CUR {}", rate);
                         self.clock_impl.set_sample_rate(rate).ok();
+                        self.nominal_fb = UsbIsochronousFeedback::new_float(
+                            rate.to_f32().unwrap() / self.audio_rate.to_f32().unwrap(),
+                        );
                         xfer.accept().ok();
                     }
                     Err(e) => {
