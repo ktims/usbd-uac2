@@ -1,22 +1,19 @@
 //! Contains hardware setup unrelated to Usb Audio Class implementation
 
-use crate::hal;
-use core::cell::{OnceCell, UnsafeCell};
-use core::mem::MaybeUninit;
-use core::ptr::null_mut;
-
 use crate::Syscon;
+use crate::hal;
 use crate::{MCLK_FREQ, SAMPLE_RATE, pac};
-use defmt::debug;
+
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+use defmt::{debug, info};
 use hal::{
-    Iocon, Pin,
+    Enabled, Iocon, Pin,
     drivers::pins,
-    prelude::*,
     traits::wg::digital::v2::{OutputPin, ToggleableOutputPin},
     typestates::pin::{gpio::direction::Output, state::Gpio},
 };
-use lpc55_hal::Enabled;
-use static_cell::StaticCell;
+
 pub(crate) struct PllConstants {
     pub m: u16,   // 1-65535
     pub n: u8,    // 1-255
@@ -138,67 +135,12 @@ pub(crate) fn init_audio_pll() {
 
     pmc.pdruncfg0
         .modify(|_, w| w.pden_pll0().poweredon().pden_pll0_sscg().poweredon());
-    debug!("pll0 wait for lock");
+    info!("pll0 wait for lock");
     let mut i = 0usize;
     while syscon.pll0stat.read().lock().bit_is_clear() {
         i += 1;
     }
-    debug!("pll0 locked after {} tries", i);
-}
-
-const SYS_PLL: PllConstants = PllConstants::new(4, 75, 1); // 150MHz
-
-pub(crate) fn init_sys_pll1() {
-    let syscon = unsafe { &*pac::SYSCON::ptr() };
-    let pmc = unsafe { &*pac::PMC::ptr() };
-    let anactrl = unsafe { &*pac::ANACTRL::ptr() };
-
-    debug!("start clk_in");
-    pmc.pdruncfg0
-        .modify(|_, w| w.pden_xtal32m().poweredon().pden_ldoxo32m().poweredon());
-    syscon.clock_ctrl.modify(|_, w| w.clkin_ena().enable());
-    anactrl
-        .xo32m_ctrl
-        .modify(|_, w| w.enable_system_clk_out().enable());
-
-    debug!("init pll1: {}", SYS_PLL);
-    pmc.pdruncfg0.modify(|_, w| w.pden_pll1().poweredoff());
-    syscon.pll1clksel.write(|w| w.sel().enum_0x1()); // clk_in
-    syscon.pll1ctrl.write(|w| unsafe {
-        w.clken()
-            .enable()
-            .seli()
-            .bits(SYS_PLL.seli)
-            .selp()
-            .bits(SYS_PLL.selp)
-    });
-
-    syscon
-        .pll1ndec
-        .write(|w| unsafe { w.ndiv().bits(SYS_PLL.n) });
-    syscon.pll1ndec.write(|w| unsafe {
-        w.ndiv().bits(SYS_PLL.n).nreq().set_bit() // latch
-    });
-    syscon
-        .pll1mdec
-        .write(|w| unsafe { w.mdiv().bits(SYS_PLL.m) });
-    syscon
-        .pll1pdec
-        .write(|w| unsafe { w.pdiv().bits(SYS_PLL.p) });
-    syscon.pll1pdec.write(|w| unsafe {
-        w.pdiv().bits(SYS_PLL.p).preq().set_bit() // latch
-    });
-
-    pmc.pdruncfg0.modify(|_, w| w.pden_pll1().poweredon());
-    debug!("pll1 wait for lock");
-    let mut i = 0usize;
-    while syscon.pll1stat.read().lock().bit_is_clear() {
-        i += 1;
-    }
-    debug!("pll1 locked after {} tries", i);
-    // switch system clock to pll1
-    syscon.fmccr.modify(|_, w| w.flashtim().flashtim11());
-    syscon.mainclkselb.modify(|_, w| w.sel().enum_0x2()); // pll1
+    info!("pll0 locked after {} loops", i);
 }
 
 pub struct I2sTx {
@@ -207,7 +149,6 @@ pub struct I2sTx {
 
 pub fn init_i2s(mut fc7: pac::FLEXCOMM7, i2s7: pac::I2S7, syscon: &mut Syscon) -> I2sTx {
     defmt::debug!("init i2s");
-    // Enable BOTH
     syscon.reset(&mut fc7);
     syscon.enable_clock(&mut fc7);
 

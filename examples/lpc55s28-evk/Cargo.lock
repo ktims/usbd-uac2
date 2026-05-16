@@ -411,6 +411,7 @@ dependencies = [
 [[package]]
 name = "lpc55-hal"
 version = "0.5.0"
+source = "git+https://github.com/ktims/lpc55-hal?branch=main#8dfefd62aff4abd2de535f23107812dda68437be"
 dependencies = [
  "block-buffer",
  "cipher",
@@ -451,10 +452,7 @@ dependencies = [
  "embedded-io",
  "log-to-defmt",
  "lpc55-hal",
- "nb 1.1.0",
- "panic-halt",
  "panic-probe",
- "static_cell",
  "usb-device",
  "usbd-uac2",
 ]
@@ -614,12 +612,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "panic-halt"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a513e167849a384b7f9b746e517604398518590a9142f4846a32e3c2a4de7b11"
 
 [[package]]
 name = "panic-probe"
@@ -824,15 +816,6 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
-name = "static_cell"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0530892bb4fa575ee0da4b86f86c667132a94b74bb72160f58ee5a4afec74c23"
-dependencies = [
- "portable-atomic",
-]
 
 [[package]]
 name = "syn"

@@ -224,7 +224,7 @@ impl<T: BbqHandle, B: bus::UsbBus> AudioHandler<'_, B> for Audio<T> {
         v = v.clamp(nominal_v - (1 << 14), nominal_v + (1 << 14));
 
         // Note: this log will cause continuous underflows
-        defmt::debug!("fill:{} err:{} fb:{=u32:x}", fill, error, v);
+        defmt::debug!("fill:{} err:{} fb:{=u32:x}", fill, error, v as u32);
 
         Some(UsbIsochronousFeedback::new(v as u32))
     }

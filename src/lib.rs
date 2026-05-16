@@ -20,9 +20,6 @@ use usb_device::device::DEFAULT_ALTERNATE_SETTING;
 use usb_device::endpoint::{self, Endpoint, EndpointDirection, In, Out};
 use usb_device::{UsbDirection, class_prelude::*};
 
-#[cfg(feature = "defmt")]
-use defmt;
-
 mod sealed {
     pub trait Sealed {}
 }
@@ -934,7 +931,7 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbClass<B>
     }
 
     fn reset(&mut self) {
-        defmt::info!("usb reset");
+        info!("usb reset");
         self.audio_impl
             .alternate_setting_changed(UsbDirection::In, 0);
         self.audio_impl
@@ -955,7 +952,7 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
                     warn!("  feedback IN failed {:?}", e);
                 }
             } else {
-                debug!("  feedback callback returned None")
+                debug!("  feedback callback returned None");
             }
         }
     }

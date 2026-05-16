@@ -2,6 +2,7 @@
 name = "lpc55s28-evk"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [features]
 default = ["usbhs"]
@@ -17,13 +18,11 @@ defmt-rtt = "1.1.0"
 embedded-hal = "1.0.0"
 embedded-io = "0.7.1"
 log-to-defmt = "0.1.0"
-lpc55-hal = { version = "0.5.0", path = "../lpc55-hal" }
-nb = "1.1.0"
-panic-halt = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
-static_cell = "2.1.1"
-usb-device = "0.3"
-usbd-uac2 = { version = "0.1.0", path = "../..", features = ["defmt"]}
+# Includes update to usb-device 0.3, fix for isochronous and smaller critical sections
+lpc55-hal = { git = "https://github.com/ktims/lpc55-hal", branch = "main" }
+usb-device.workspace = true
+usbd-uac2 = { workspace = true, features = ["defmt"] }
 
 [profile.release]
 opt-level = "z"

@@ -233,13 +233,37 @@ impl<const N: usize, const MAX_SLOT_BYTES: usize> DmaRing<N, MAX_SLOT_BYTES> {
     pub fn produced(&self) -> usize {
         self.produced.load(Ordering::Acquire)
     }
-
+    pub fn produced_bytes(&self) -> usize {
+        self.produced_bytes.load(Ordering::Acquire)
+    }
     pub fn consumed(&self) -> usize {
         self.consumed.load(Ordering::Acquire)
     }
     pub fn consumed_bytes(&self) -> usize {
-        self.consumed.load(Ordering::Acquire) * self.slot_bytes
-            + (self.dma.channel19.xfercfg.read().bits() as usize >> 16 & 0x3ff)
+        loop {
+            let consumed_start = self.consumed.load(Ordering::Acquire);
+
+            let reg_1 = self.dma.channel19.xfercfg.read().bits() as usize >> 16 & 0x3ff;
+            let reg_2 = self.dma.channel19.xfercfg.read().bits() as usize >> 16 & 0x3ff;
+
+            let consumed_end = self.consumed.load(Ordering::Acquire);
+
+            if consumed_start == consumed_end && reg_1 == reg_2 {
+                // 1. Map the hardware remaining countdown into a clean byte count
+                let remaining_bytes = if reg_1 == 0x3ff {
+                    0 // 0x3FF means all transfers completed, 0 bytes remaining
+                } else {
+                    // Formula from NXP manual: (XFERCOUNT + 1) * Data Width
+                    (reg_1 + 1) * self.word_bytes
+                };
+
+                // 2. Total bytes consumed in this specific active slot
+                let active_slot_consumed = self.slot_bytes - remaining_bytes;
+
+                // 3. Combine with your software index history accumulator
+                return consumed_start * self.slot_bytes + active_slot_consumed;
+            }
+        }
     }
 
     pub fn fill_slots(&self) -> usize {
@@ -319,7 +343,7 @@ impl<const N: usize, const MAX_SLOT_BYTES: usize> DmaRing<N, MAX_SLOT_BYTES> {
         let slots = unsafe { &mut *self.slots.get() };
         let desc = unsafe { &mut *self.desc.get() };
         let chan_desc = unsafe { &mut *self.channel_desc.get() };
-        defmt::info!("slots base: &{:x}", self.slots.get());
+        defmt::debug!("slots base: &{:x}", self.slots.get());
 
         // Pre-fill with silence so underrun replays silence.
         for i in 0..N {

@@ -1,10 +1,21 @@
+[workspace]
+members = [
+    "examples/lpc55s28-evk",
+    "examples/lpc55s28-evk-dma"
+]
+resolver = "2"
+
+[workspace.dependencies]
+usb-device = { version = "0.3", features = ["control-buffer-256"] }
+usbd-uac2 = { path = "." }
+
 [package]
 name = "usbd-uac2"
 description = "USB Audio Class 2.0 for usb-device"
 authors = ["Keenan Tims <ktims@gotroot.ca>"]
 version = "0.1.0"
 edition = "2024"
-keywords = ["no-std", "usb-device"]
+keywords = ["no-std", "usb-device", "audio"]
 
 [features]
 defmt = ["dep:defmt", "usb-device/defmt"]
@@ -15,4 +26,4 @@ defmt = { version = "1.0.1", optional = true }
 embedded-io = "0.7.1"
 modular-bitfield = "0.13.1"
 num-traits = { version = "0.2.19", default-features = false }
-usb-device = { version = "0.3", features = ["control-buffer-256"] }
+usb-device.workspace = true
