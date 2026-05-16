@@ -195,7 +195,7 @@ impl Descriptor for ClockSource {
         writer.write_u8(self.bm_attributes())?; // bmAttributes
         writer.write_u8(self.bm_controls())?; // bmControls
         writer.write_u8(self.assoc_terminal)?; // bAssocTerminal
-        writer.write_u8(self.string.map_or(0, |n| u8::from(n)))?; // iClockSource
+        writer.write_u8(self.string.map_or(0, u8::from))?; // iClockSource
         Ok(())
     }
 }
@@ -247,7 +247,7 @@ impl Descriptor for InputTerminal {
                 | ((self.overflow_control as u8) << 2)
                 | ((self.phantom_power_control as u8) << 4),
         )?;
-        writer.write_u8(self.string.map_or(0, |s| u8::from(s)))?;
+        writer.write_u8(self.string.map_or(0, u8::from))?;
         Ok(())
     }
 }
@@ -289,7 +289,7 @@ impl Descriptor for OutputTerminal {
                 | ((self.underflow_control as u8) << 6),
         )?;
         writer.write_u8(self.overflow_control as u8)?;
-        writer.write_u8(self.string.map_or(0, |n| u8::from(n)))?; // iTerminal
+        writer.write_u8(self.string.map_or(0, u8::from))?; // iTerminal
         Ok(())
     }
 }
@@ -839,7 +839,7 @@ impl Descriptor for AudioStreamingInterface {
         writer.write_u32::<LittleEndian>(self.format_bitmap as u32)?;
         writer.write_u8(self.num_channels)?;
         writer.write(&self.channel_config.bytes)?;
-        writer.write_u8(self.string.map_or(0, |s| u8::from(s)))?;
+        writer.write_u8(self.string.map_or(0, u8::from))?;
         Ok(())
     }
 }

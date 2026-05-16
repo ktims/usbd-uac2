@@ -1,4 +1,5 @@
 // src/log.rs (or log/mod.rs)
+#[allow(unused_imports)]
 #[cfg(feature = "defmt")]
 pub use defmt::{debug, error, info, trace, warn};
 

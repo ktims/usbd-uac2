@@ -16,7 +16,7 @@ use log::*;
 
 use num_traits::{ConstZero, ToPrimitive};
 use usb_device::control::{Recipient, Request, RequestType};
-use usb_device::device::DEFAULT_ALTERNATE_SETTING;
+use usb_device::device::{DEFAULT_ALTERNATE_SETTING, UsbDeviceBuilder, UsbVidPid};
 use usb_device::endpoint::{self, Endpoint, EndpointDirection, In, Out};
 use usb_device::{UsbDirection, class_prelude::*};
 
@@ -63,7 +63,7 @@ impl RangeType for u32 {}
 /// Represent a range request/response.
 ///
 /// ref: UAC2 5.2.2
-#[derive(PartialEq, Eq, Ord)]
+#[derive(PartialEq, Eq)]
 pub struct RangeEntry<T: RangeType> {
     pub min: T,
     pub max: T,
@@ -93,10 +93,14 @@ impl<T: RangeType> RangeEntry<T> {
 // The spec guarantees that ranges do not overlap, so compare by min is correct.
 impl<T: RangeType + PartialOrd> PartialOrd for RangeEntry<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.min.partial_cmp(&other.min)
+        Some(self.cmp(other))
     }
 }
-
+impl<T: RangeType + PartialOrd> Ord for RangeEntry<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.min.cmp(&other.min)
+    }
+}
 /// Represent Isochronous feedback as integer and fractional parts, internally as 16.16.
 ///
 /// Provides conversions to and from the different USB formats.
@@ -146,6 +150,10 @@ pub trait AudioHandler<'a, B: UsbBus> {
     /// `ep.read()`.
     fn audio_data_rx(&mut self, ep: &Endpoint<'a, B, endpoint::Out>);
 
+    /// Called when we must produce audio data for the host. `ep` is ready for
+    /// `ep.write()`.
+    fn audio_data_tx(&mut self, ep: &Endpoint<'a, B, endpoint::In>);
+
     /// Called when it's time to send an isochronous feedback update. Should
     /// return the correct feedback payload. Feedback always runs at 1ms (in
     /// this implementation), and will be passed the nominal frame size.
@@ -183,6 +191,7 @@ pub trait ClockSource {
     fn sample_rate(&self) -> u32;
     /// Called when the host requests to set the sample rate. Not necessarily called at all startups,
     /// so alt_setting should start/stop the clock. Not required for 'fixed' clocks.
+    #[allow(unused_variables)]
     fn set_sample_rate(
         &mut self,
         sample_rate: u32,
@@ -239,7 +248,7 @@ pub trait ClockSource {
         };
 
         let cs = descriptors::ClockSource {
-            id: id,
+            id,
             clock_type: Self::CLOCK_TYPE,
             sof_sync: Self::SOF_SYNC,
             frequency_access,
@@ -367,6 +376,7 @@ pub struct TerminalConfig<D: EndpointDirection> {
 }
 
 impl<D: EndpointDirection> TerminalConfig<D> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         base_id: u8,
         clock_source_id: u8,
@@ -400,7 +410,7 @@ impl<D: EndpointDirection> TerminalConfig<D> {
         TerminalConfigBuilder::new()
     }
 }
-impl<'a> TerminalConfigurationDescriptors for TerminalConfig<Out> {
+impl TerminalConfigurationDescriptors for TerminalConfig<Out> {
     fn get_configuration_descriptors(&self) -> (InputTerminal, OutputTerminal) {
         let input_terminal = InputTerminal {
             id: self.base_id,
@@ -437,7 +447,7 @@ impl<'a> TerminalConfigurationDescriptors for TerminalConfig<Out> {
     // fn get_interface_descriptor(&self, id: InterfaceIndex) )
 }
 
-impl<'a> TerminalConfigurationDescriptors for TerminalConfig<In> {
+impl TerminalConfigurationDescriptors for TerminalConfig<In> {
     fn get_configuration_descriptors(&self) -> (InputTerminal, OutputTerminal) {
         let output_terminal = OutputTerminal {
             id: self.base_id,
@@ -838,7 +848,7 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbClass<B>
 
         // UAC2 4.7
         if let Some(descs) = additional_descs {
-            for desc in descs.into_iter() {
+            for desc in descs.iter() {
                 desc.write_descriptor(writer)?;
             }
         }
@@ -893,10 +903,14 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbClass<B>
 
     fn endpoint_in_complete(&mut self, addr: EndpointAddress) {
         debug!("EP {} IN complete", addr);
-        if let Some(fb_ep) = self.feedback.as_ref()
+        if let Some(_fb_ep) = self.feedback.as_ref()
             && addr.index() == self.fb_ep
         {
             self.emit_feedback();
+        } else if let Some(in_ep) = self.input.as_ref()
+            && addr.index() == self.in_ep
+        {
+            self.audio_impl.audio_data_tx(&in_ep.endpoint);
         } else {
             debug!("  unexpected IN on {}", addr);
         }
@@ -978,11 +992,11 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
 
     fn class_request_out(&mut self, xfer: ControlOut<B>) {
         let req = xfer.request();
-        match (req.recipient, req.request.try_into()) {
-            (Recipient::Interface, Ok(ClassSpecificRequest::Cur)) => self.set_interface_cur(xfer),
-            (Recipient::Interface, Ok(ClassSpecificRequest::Range)) => {}
-            (Recipient::Endpoint, Ok(ClassSpecificRequest::Cur)) => self.set_endpoint_cur(xfer),
-            (Recipient::Endpoint, Ok(ClassSpecificRequest::Range)) => {}
+        match (req.recipient, req.request.into()) {
+            (Recipient::Interface, ClassSpecificRequest::Cur) => self.set_interface_cur(xfer),
+            (Recipient::Interface, ClassSpecificRequest::Range) => {}
+            (Recipient::Endpoint, ClassSpecificRequest::Cur) => self.set_endpoint_cur(xfer),
+            (Recipient::Endpoint, ClassSpecificRequest::Range) => {}
             _ => {
                 debug!("   Unimplemented.");
             }
@@ -992,13 +1006,11 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
     fn class_request_in(&mut self, xfer: ControlIn<B>) {
         let req = xfer.request();
 
-        match (req.recipient, req.request.try_into()) {
-            (Recipient::Interface, Ok(ClassSpecificRequest::Cur)) => self.get_interface_cur(xfer),
-            (Recipient::Interface, Ok(ClassSpecificRequest::Range)) => {
-                self.get_interface_range(xfer)
-            }
-            (Recipient::Endpoint, Ok(ClassSpecificRequest::Cur)) => self.get_endpoint_cur(xfer),
-            (Recipient::Endpoint, Ok(ClassSpecificRequest::Range)) => self.get_endpoint_range(xfer),
+        match (req.recipient, req.request.into()) {
+            (Recipient::Interface, ClassSpecificRequest::Cur) => self.get_interface_cur(xfer),
+            (Recipient::Interface, ClassSpecificRequest::Range) => self.get_interface_range(xfer),
+            (Recipient::Endpoint, ClassSpecificRequest::Cur) => self.get_endpoint_cur(xfer),
+            (Recipient::Endpoint, ClassSpecificRequest::Range) => self.get_endpoint_range(xfer),
             _ => {
                 debug!("   Unimplemented.");
             }
@@ -1012,12 +1024,16 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
 
         debug!("  SET_ALT_INTERFACE {} {}", iface, alt_setting);
 
-        if self.input.is_some() && iface == self.in_iface {
-            let old_alt = self.input.as_ref().unwrap().alt_setting;
+        if let Some(input) = &mut self.input
+            && iface == self.in_iface
+        {
+            let old_alt = input.alt_setting;
             if old_alt != alt_setting {
                 self.audio_impl
                     .alternate_setting_changed(UsbDirection::In, alt_setting);
-                self.input.as_mut().unwrap().alt_setting = alt_setting;
+                input.alt_setting = alt_setting;
+                // Start the IN cycle
+                self.audio_impl.audio_data_tx(&input.endpoint);
                 xfer.accept().ok();
             }
         } else if self.output.is_some() && iface == self.out_iface {
@@ -1041,13 +1057,15 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
         let req = xfer.request();
         let iface = req.index as u8;
         debug!("  GET_ALT_INTERFACE {}", iface);
-        if self.input.is_some() && iface == self.in_iface {
-            xfer.accept_with(&[self.input.as_ref().unwrap().alt_setting])
-                .ok();
+        if let Some(input) = self.input.as_ref()
+            && iface == self.in_iface
+        {
+            xfer.accept_with(&[input.alt_setting]).ok();
             return;
-        } else if self.output.is_some() && iface == self.out_iface {
-            xfer.accept_with(&[self.output.as_ref().unwrap().alt_setting])
-                .ok();
+        } else if let Some(output) = self.output.as_ref()
+            && iface == self.out_iface
+        {
+            xfer.accept_with(&[output.alt_setting]).ok();
             return;
         }
         debug!("   Unimplemented.");
@@ -1109,9 +1127,8 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
         channel: u8,
         control: u8,
     ) {
-        match entity {
-            1 => return self.get_clock_cur(xfer, channel, control),
-            _ => {}
+        if entity == 1 {
+            return self.get_clock_cur(xfer, channel, control);
         }
         debug!("   Unimplemented.");
     }
@@ -1123,49 +1140,48 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
         channel: u8,
         control: u8,
     ) {
-        match entity {
-            1 => return self.set_clock_cur(xfer, channel, control),
-            _ => {}
+        if entity == 1 {
+            return self.set_clock_cur(xfer, channel, control);
         }
         debug!("   Unimplemented.");
     }
 
     fn set_streaming_interface_cur(
         &mut self,
-        xfer: ControlOut<B>,
-        direction: UsbDirection,
-        entity: u8,
-        channel: u8,
-        control: u8,
+        _xfer: ControlOut<B>,
+        _direction: UsbDirection,
+        _entity: u8,
+        _channel: u8,
+        _control: u8,
     ) {
         debug!("   Unimplemented.");
     }
 
     fn get_endpoint_cur(&mut self, xfer: ControlIn<B>) {
         let req = xfer.request();
-        let entity = (req.index >> 8) as u8;
-        let interface = (req.index & 0xff) as u8;
-        let control = (req.value >> 8) as u8;
-        let channel = (req.value & 0xff) as u8;
+        let _entity = (req.index >> 8) as u8;
+        let _interface = (req.index & 0xff) as u8;
+        let _control = (req.value >> 8) as u8;
+        let _channel = (req.value & 0xff) as u8;
 
         debug!("   Unimplemented.");
     }
     fn get_endpoint_range(&mut self, xfer: ControlIn<B>) {
         let req = xfer.request();
-        let entity = (req.index >> 8) as u8;
-        let interface = (req.index & 0xff) as u8;
-        let control = (req.value >> 8) as u8;
-        let channel = (req.value & 0xff) as u8;
+        let _entity = (req.index >> 8) as u8;
+        let _interface = (req.index & 0xff) as u8;
+        let _control = (req.value >> 8) as u8;
+        let _channel = (req.value & 0xff) as u8;
 
         debug!("   Unimplemented.");
     }
 
     fn set_endpoint_cur(&mut self, xfer: ControlOut<B>) {
         let req = xfer.request();
-        let entity = (req.index >> 8) as u8;
-        let interface = (req.index & 0xff) as u8;
-        let control = (req.value >> 8) as u8;
-        let channel = (req.value & 0xff) as u8;
+        let _entity = (req.index >> 8) as u8;
+        let _interface = (req.index & 0xff) as u8;
+        let _control = (req.value >> 8) as u8;
+        let _channel = (req.value & 0xff) as u8;
 
         debug!("   Unimplemented.");
     }
@@ -1203,8 +1219,8 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
         }
     }
     fn get_clock_cur(&mut self, xfer: ControlIn<B>, channel: u8, control: u8) {
-        match control.try_into() {
-            Ok(ClockSourceControlSelector::SamFreqControl) => {
+        match control.into() {
+            ClockSourceControlSelector::SamFreqControl => {
                 debug!("   SamplingFreqControl");
                 if channel != 0 {
                     error!(
@@ -1222,7 +1238,7 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
                 })
                 .ok();
             }
-            Ok(ClockSourceControlSelector::ClockValidControl) => {
+            ClockSourceControlSelector::ClockValidControl => {
                 debug!("   ClockValidControl");
                 if channel != 0 {
                     error!(
@@ -1248,8 +1264,8 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
         }
     }
     fn set_clock_cur(&mut self, xfer: ControlOut<B>, channel: u8, control: u8) {
-        match control.try_into() {
-            Ok(ClockSourceControlSelector::SamFreqControl) => {
+        match control.into() {
+            ClockSourceControlSelector::SamFreqControl => {
                 debug!("   SamplingFreqControl");
                 if channel != 0 {
                     error!(
@@ -1266,7 +1282,7 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
                         );
                         xfer.accept().ok();
                     }
-                    Err(e) => {
+                    Err(_e) => {
                         error!("   SET SamplingFreqControl CUR ERROR BAD DATA");
                     }
                 }
@@ -1277,8 +1293,8 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
         }
     }
     fn get_clock_range(&mut self, xfer: ControlIn<B>, channel: u8, control: u8) {
-        match control.try_into() {
-            Ok(ClockSourceControlSelector::SamFreqControl) => {
+        match control.into() {
+            ClockSourceControlSelector::SamFreqControl => {
                 debug!("   SamplingFreqControl");
                 if channel != 0 {
                     error!(
@@ -1320,4 +1336,16 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
             }
         }
     }
+}
+
+/// Set up a `UsbDeviceBuilder` with the device IDs for Usb Audio Class 2.0
+pub fn builder<'a, B: UsbBus>(
+    alloc: &'a UsbBusAllocator<B>,
+    vid_pid: UsbVidPid,
+) -> UsbDeviceBuilder<'a, B> {
+    UsbDeviceBuilder::new(alloc, vid_pid)
+        .composite_with_iads() // required by UAC2 4.6
+        .device_class(0xef) // required by UAC2 4.2
+        .device_sub_class(0x02) // required by UAC2 4.2
+        .device_protocol(0x01) // required by UAC2 4.2
 }
