@@ -10,6 +10,7 @@ use defmt::debug;
 use hal::{
     Enabled, Iocon, Pin,
     drivers::pins,
+    peripherals::syscon::{ClockControl, ResetControl},
     traits::wg::digital::v2::{OutputPin, ToggleableOutputPin},
     typestates::pin::{gpio::direction::Output, state::Gpio},
 };
@@ -143,18 +144,35 @@ pub(crate) fn init_audio_pll() {
     debug!("pll0 locked after {} tries", i);
 }
 
-pub struct I2sTx {
-    pub i2s: pac::I2S7,
+pub struct I2sHandles {
+    pub tx: pac::I2S7,
+    pub rx: pac::I2S6,
 }
 
-pub fn init_i2s(mut fc7: pac::FLEXCOMM7, i2s7: pac::I2S7, syscon: &mut Syscon) -> I2sTx {
+pub fn init_i2s(
+    fc7: pac::FLEXCOMM7,
+    i2s7: pac::I2S7,
+    fc6: pac::FLEXCOMM6,
+    i2s6: pac::I2S6,
+    syscon: &mut Syscon,
+) -> I2sHandles {
     defmt::debug!("init i2s");
     // Enable BOTH
-    syscon.reset(&mut fc7);
-    syscon.enable_clock(&mut fc7);
-
-    unsafe {
-        pac::IOCON::ptr().as_ref().unwrap().pio1_31.modify(|_, w| {
+    fc7.clear_reset(syscon);
+    fc7.enable_clock(syscon);
+    fc6.clear_reset(syscon);
+    fc6.enable_clock(syscon);
+    {
+        let sc = unsafe { pac::SYSCON::ptr().as_ref().unwrap() };
+        let ioc = unsafe { pac::IOCON::ptr().as_ref().unwrap() };
+        // MCLK source
+        //
+        sc.mclkclksel.write(|w| w.sel().enum_0x1()); // PLL0
+        // MCLK div
+        sc.mclkdiv
+            .write(|w| unsafe { w.div().bits(1).halt().run().reset().released() }); // div by 2 = PLL0 fout / 2 = 12.288MHz, max for WM8904 @ 96k
+        // MCLK out config
+        ioc.pio1_31.modify(|_, w| {
             w.func()
                 .alt1()
                 .mode()
@@ -168,57 +186,65 @@ pub fn init_i2s(mut fc7: pac::FLEXCOMM7, i2s7: pac::I2S7, syscon: &mut Syscon) -
                 .od()
                 .normal()
         });
-        pac::SYSCON::ptr()
-            .as_ref()
-            .unwrap()
-            .fcclksel7()
-            .modify(|_, w| w.sel().enum_0x5()); // MCLK
-        pac::SYSCON::ptr()
-            .as_ref()
-            .unwrap()
-            .mclkclksel
-            .modify(|_, w| w.sel().enum_0x1()); // PLL0
-        pac::SYSCON::ptr()
-            .as_ref()
-            .unwrap()
-            .mclkdiv
-            .modify(|_, w| w.div().bits(1).halt().run().reset().released()); // div by 2 = PLL0 fout / 2 = 12.288MHz, max for WM8904 @ 96k
-        pac::SYSCON::ptr()
-            .as_ref()
-            .unwrap()
-            .mclkio
-            .modify(|_, w| w.mclkio().output());
-    };
+        // FC7 clock
+        sc.fcclksel7().modify(|_, w| w.sel().enum_0x5()); // MCLK
+        // FC6 clock
+        sc.fcclksel6().modify(|_, w| w.sel().enum_0x5()); // MCLK
+        // MCLK out
+        sc.mclkio.modify(|_, w| w.mclkio().output());
+
+        // Enable clock for sysctl, it's not mapped into Peripherals
+        sc.ahbclkctrlset[2].write(|w| unsafe { w.bits(1 << 15) });
+        while sc.ahbclkctrl2.read().sysctl().is_disable() {}
+        let sysctrl = unsafe { pac::SYSCTL::ptr().as_ref().unwrap() };
+        sysctrl.sharedctrlset[0].write(|w| w.sharedscksel().flexcomm7().sharedwssel().flexcomm7()); // FC7 drives shared SCK, WS
+        sysctrl.fcctrlsel[7].write(|w| {
+            w.sckinsel()
+                .shared_set0_i2s_signals()
+                .wsinsel()
+                .shared_set0_i2s_signals()
+        }); // FC7 uses shared set
+        sysctrl.fcctrlsel[6].write(|w| {
+            w.sckinsel()
+                .shared_set0_i2s_signals()
+                .wsinsel()
+                .shared_set0_i2s_signals()
+        });
+
+        // for _ in 0..1000 {
+        //     cortex_m::asm::nop();
+        // }
+    }
 
     // Select I2S TX function
     fc7.pselid.write(|w| w.persel().i2s_transmit());
+    // Select I2S RX function
+    fc6.pselid.write(|w| w.persel().i2s_receive());
 
-    let regs = i2s7;
+    let out_regs = i2s7;
+    let in_regs = i2s6;
 
     // Enable TX FIFO only
-    regs.fifocfg.modify(|_, w| {
+    out_regs.fifocfg.write(|w| {
         w.enabletx()
             .enabled()
-            .enablerx()
-            .disabled()
-            .dmatx()
-            .disabled()
-            .txi2se0()
+            .txi2se0() // transmit 0s when empty - only supported option for 32b data
             .zero()
+            .emptytx() // reset the tx queue
+            .set_bit()
     });
 
-    // Flush
-    regs.fifocfg.modify(|_, w| w.emptytx().set_bit());
-
-    regs.cfg2
-        .modify(|_, w| unsafe { w.position().bits(0).framelen().bits(63) }); // framelen = 64
+    out_regs
+        .cfg2
+        .write(|w| unsafe { w.position().bits(0).framelen().bits(63) }); // framelen = 64
 
     let bclk_div = (MCLK_FREQ / SAMPLE_RATE / 64) as u16;
-    regs.div
-        .modify(|_, w| unsafe { w.div().bits(bclk_div - 1) }); // Clock source is MCLK (12.288MHz) / 4 = 3MHz
+    out_regs
+        .div
+        .write(|w| unsafe { w.div().bits(bclk_div - 1) }); // Clock source is MCLK (12.288MHz) / 4 = 3MHz
 
-    // Config
-    regs.cfg1.modify(|_, w| unsafe {
+    // TX Config
+    out_regs.cfg1.write(|w| unsafe {
         w.mstslvcfg()
             .normal_master()
             .onechannel()
@@ -233,7 +259,33 @@ pub fn init_i2s(mut fc7: pac::FLEXCOMM7, i2s7: pac::I2S7, syscon: &mut Syscon) -
             .normal()
     });
 
-    I2sTx { i2s: regs }
+    // Enable RX FIFO only
+    in_regs
+        .fifocfg
+        .write(|w| w.enablerx().enabled().emptyrx().set_bit());
+    in_regs
+        .cfg2
+        .write(|w| unsafe { w.position().bits(0).framelen().bits(63) }); // framelen = 64
+    in_regs.div.write(|w| unsafe { w.div().bits(0) });
+    in_regs.cfg1.write(|w| unsafe {
+        w.mstslvcfg()
+            .normal_slave_mode()
+            .onechannel()
+            .dual_channel()
+            .datalen()
+            .bits(31)
+            .mainenable()
+            .enabled()
+            .mode()
+            .classic_mode()
+            .datapause()
+            .normal()
+    });
+
+    I2sHandles {
+        tx: out_regs,
+        rx: in_regs,
+    }
 }
 
 pub struct SharedLed<T: OutputPin> {
