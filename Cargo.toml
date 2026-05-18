@@ -12,9 +12,12 @@ usbd-uac2 = { path = "." }
 [package]
 name = "usbd-uac2"
 description = "USB Audio Class 2.0 for usb-device"
+readme = "README.md"
 authors = ["Keenan Tims <ktims@gotroot.ca>"]
+repository = "https://github.com/ktims/usbd_uac2"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 keywords = ["no-std", "usb-device", "audio"]
 
 [features]
