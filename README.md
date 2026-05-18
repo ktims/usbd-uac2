@@ -1,3 +1,5 @@
+![Crates.io Version](https://img.shields.io/crates/v/usbd-uac2) ![docs.rs](https://img.shields.io/docsrs/usbd-uac2)
+
 # usbd-uac2
 
 USB Audio Class 2.0
