@@ -38,7 +38,7 @@ use pac::interrupt;
 use static_cell::StaticCell;
 use usb_device::{
     bus::{self},
-    device::{StringDescriptors, UsbDeviceBuilder, UsbVidPid},
+    device::{StringDescriptors, UsbVidPid},
 };
 use usbd_uac2::TerminalConfig;
 use usbd_uac2::{
@@ -52,6 +52,12 @@ use crate::hw::{I2sTx, blue_led, green_led, red_led};
 mod dma;
 mod hw;
 mod wm8904;
+
+// pid.codes test IDs
+const USB_VID: u16 = 0x1209;
+const USB_PID: u16 = 0x0001;
+const USB_MANUFACTURER: &str = "usbd_uac2";
+const USB_PRODUCT: &str = "DMA example device";
 
 const CODEC_I2C_ADDR: u8 = 0b0011010;
 const MCLK_FREQ: u32 = 12288000;
@@ -199,6 +205,11 @@ impl<const N: usize, const MAX_SLOT_BYTES: usize, B: bus::UsbBus> AudioHandler<'
             self.running.store(true, Ordering::Relaxed)
         }
     }
+    fn audio_data_tx(
+        &mut self,
+        _ep: &usb_device::endpoint::Endpoint<'_, B, usb_device::endpoint::In>,
+    ) {
+    }
 
     /// Provide rate feedback to the host. P-only is stable and works fine, with
     /// most hosts. The host can either filter it internally or treat it
@@ -229,7 +240,7 @@ impl<const N: usize, const MAX_SLOT_BYTES: usize, B: bus::UsbBus> AudioHandler<'
         // 0.2% which is a huge clock error
         let max_allowed_deviation = nominal_v / 500;
 
-        let p_term = -(error_permille * nominal_v) / 256000; // this works reasonably well to keep the buffer 
+        let p_term = -(error_permille * nominal_v) / 256000; // this works reasonably well to keep the buffer
         let i_term = 0; // placeholder
 
         let mut v = nominal_v + p_term + i_term;
@@ -379,18 +390,13 @@ fn main() -> ! {
         .with_output_config(TerminalConfig::builder().base_id(2).build());
     let mut uac2 = config.build(&usb_bus).unwrap();
 
-    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x1209, 0xcc1d))
-        .composite_with_iads()
+    let mut usb_dev = usbd_uac2::builder(&usb_bus, UsbVidPid(USB_VID, USB_PID))
         .strings(&[StringDescriptors::default()
-            .manufacturer("Generic")
-            .product("usbd_uac2 device")
-            .serial_number("123456789")])
+            .manufacturer(USB_MANUFACTURER)
+            .product(USB_PRODUCT)])
         .unwrap()
-        .max_packet_size_0(64)
+        .max_packet_size_0(64) // Required to be 64 on HS, allowed on FS
         .unwrap()
-        .device_class(0xef)
-        .device_sub_class(0x02)
-        .device_protocol(0x01)
         .build();
 
     defmt::info!("main loop");

@@ -24,9 +24,3 @@ static_cell = "2.1.1"
 lpc55-hal = { git = "https://github.com/ktims/lpc55-hal", branch = "main" }
 usb-device.workspace = true
 usbd-uac2 = { workspace = true, features = ["defmt"] }
-
-[profile.release]
-opt-level = "z"
-lto = true
-debug = true
-codegen-units = 1

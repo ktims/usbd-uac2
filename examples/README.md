@@ -3,7 +3,7 @@ Two example backends are provided, both based on the LPCXpresso55S28 demo board,
 ## LPC55S28 (LPCXpresso55S28)
 
 These examples work on the
-(LPCXpresso55S28)[https://www.nxp.com/design/design-center/software/development-software/mcuxpresso-software-and-tools-/lpcxpresso-boards/lpcxpresso55s28-development-board:LPC55S28-EVK]
+[LPCXpresso55S28](https://www.nxp.com/design/design-center/software/development-software/mcuxpresso-software-and-tools-/lpcxpresso-boards/lpcxpresso55s28-development-board:LPC55S28-EVK)
 development board. They use the onboard WM8904 codec, so don't require any
 additional hardware for audio I/O.
 

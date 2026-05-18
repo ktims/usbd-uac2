@@ -23,9 +23,3 @@ panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 lpc55-hal = { git = "https://github.com/ktims/lpc55-hal", branch = "main" }
 usb-device.workspace = true
 usbd-uac2 = { workspace = true, features = ["defmt"] }
-
-[profile.release]
-opt-level = "z"
-lto = true
-debug = true
-codegen-units = 1
