@@ -19,6 +19,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 keywords = ["no-std", "usb-device", "audio"]
+exclude = [
+    "examples/**"
+]
 
 [features]
 defmt = ["dep:defmt", "usb-device/defmt"]
