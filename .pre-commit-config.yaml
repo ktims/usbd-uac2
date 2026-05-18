@@ -1,0 +1,39 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: fix-byte-order-marker
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+  - repo: https://github.com/pre-commit/pre-commit
+    rev: v3.6.2
+    hooks:
+      - id: validate_manifest
+  - repo: https://github.com/jorisroovers/gitlint
+    rev: v0.19.1
+    hooks:
+      - id: gitlint
+  - repo: https://github.com/FeryET/pre-commit-rust
+    rev: v1.2.1
+    hooks:
+      - id: fmt
+      - id: cargo-check
+      - id: clippy
+      - id: build
+  - repo: local
+    hooks:
+      - id: readme
+        name: readme
+        language: system
+        description: Rebuild README.md
+        types: [file]
+        files: src/lib.rs
+        stages:
+          - pre-commit
+        entry: cargo readme > README.md
+        pass_filenames: false
