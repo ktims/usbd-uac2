@@ -1,3 +1,47 @@
+//! USB Audio Class 2.0
+//!
+//! This crate provides a USB Audio Class 2.0 implementation for
+//! [usb-device](https://crates.io/crates/usb-device). It implements all
+//! required elements of the specification, however many controls are not
+//! implemented (e.g. mixers, effects).
+//!
+//! Device behaviour is driven by implementing the `ClockSource` and
+//! `AudioHandler` traits to configure the audio pipeline and source/sink data
+//! to/from USB.
+//!
+//! Example (creates a UAC2 device with in and out streams):
+//!
+//! ```ignore
+//! let mut audio = YourTraitImpl {...};
+//!
+//! let config = UsbAudioClassConfig::new(usb_speed, FunctionCode::IoBox, &mut audio)
+//!     // base_id is USB entity ID, id 1 is always taken by the clock source, and each stream builds 2 entities
+//!     .with_output_config(TerminalConfig::builder().base_id(2).build())
+//!     .with_input_config(TerminalConfig::builder().base_id(4).build());
+//!
+//! let mut uac2 = config.build(&usb_bus).unwrap();
+//!
+//! let mut usb_dev = usbd_uac2::builder(&usb_bus, UsbVidPid(0x1209, 0x0001))
+//!     .strings(&[StringDescriptors::default()
+//!         .manufacturer("usbd_uac2")
+//!         .product("example")])
+//!     .unwrap()
+//!     .max_packet_size_0(64) // Required to be 64 on HS
+//!     .unwrap()
+//!     .build();
+//! ```
+//!
+//! No work needs to be done in the poll loop, the class implementation will
+//! call your trait callbacks as required, just call the usb poll as usual:
+//!
+//! ```ignore
+//! loop {
+//!     usb_dev.poll(&mut [&mut uac2]);
+//! }
+//! ```
+//!
+//! See the trait documentation or examples for additional details.
+
 #![no_std]
 #![allow(dead_code)]
 
@@ -9,11 +53,12 @@ mod log;
 use core::cmp::Ordering;
 use core::marker::PhantomData;
 
-use byteorder_embedded_io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use constants::*;
 use descriptors::*;
+#[allow(unused_imports)]
 use log::*;
 
+use byteorder_embedded_io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use num_traits::{ConstZero, ToPrimitive};
 use usb_device::control::{Recipient, Request, RequestType};
 use usb_device::device::{DEFAULT_ALTERNATE_SETTING, UsbDeviceBuilder, UsbVidPid};
@@ -936,8 +981,8 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbClass<B>
                         break;
                     }
                     Err(UsbError::WouldBlock) => break,
-                    Err(err) => {
-                        debug!("EP OUT error {:?}", err);
+                    Err(_err) => {
+                        debug!("EP OUT error {:?}", _err);
                     }
                 }
             }
@@ -962,8 +1007,8 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
                     UsbSpeed::Low | UsbSpeed::Full => fb_ep.write(&fb.to_bytes_10_14()),
                     UsbSpeed::High | UsbSpeed::Super => fb_ep.write(&fb.to_bytes_12_13()),
                 };
-                if let Err(e) = r {
-                    warn!("  feedback IN failed {:?}", e);
+                if let Err(_e) = r {
+                    warn!("  feedback IN failed {:?}", _e);
                 }
             } else {
                 debug!("  feedback callback returned None");

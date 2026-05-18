@@ -27,3 +27,9 @@ embedded-io = "0.7.1"
 modular-bitfield = "0.13.1"
 num-traits = { version = "0.2.19", default-features = false }
 usb-device.workspace = true
+
+[profile.release]
+opt-level = "z"
+lto = true
+debug = true
+codegen-units = 1

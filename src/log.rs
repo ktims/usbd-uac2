@@ -7,25 +7,36 @@ pub use defmt::{debug, error, info, trace, warn};
 mod no_defmt {
     #[macro_export]
     macro_rules! trace {
-        ($($t:tt)*) => {};
+        ($($t:tt)*) => {
+            ()
+        };
     }
     #[macro_export]
     macro_rules! debug {
-        ($($t:tt)*) => {};
+        ($($t:tt)*) => {
+            ()
+        };
     }
     #[macro_export]
     macro_rules! info {
-        ($($t:tt)*) => {};
+        ($($t:tt)*) => {
+            ()
+        };
     }
     #[macro_export]
     macro_rules! warn {
-        ($($t:tt)*) => {};
+        ($($t:tt)*) => {
+            ()
+        };
     }
     #[macro_export]
     macro_rules! error {
-        ($($t:tt)*) => {};
+        ($($t:tt)*) => {
+            ()
+        };
     }
 }
 
+#[allow(unused_imports)]
 #[cfg(not(feature = "defmt"))]
 pub use no_defmt::*;
