@@ -1385,6 +1385,12 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
             }
         }
     }
+    pub fn max_read_packet_size(&self) -> core::result::Result<u16, UsbAudioClassError> {
+        match self.output.as_ref() {
+            Some(output) => Ok(output.endpoint.max_packet_size()),
+            None => Err(UsbAudioClassError::Other),
+        }
+    }
 }
 
 /// Set up a `UsbDeviceBuilder` with the device IDs for Usb Audio Class 2.0
