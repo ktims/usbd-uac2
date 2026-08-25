@@ -999,6 +999,10 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbClass<B>
 }
 
 impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, AU> {
+    /// Expose the owned AudioHandler implementation
+    pub fn handler(&mut self) -> &mut AU {
+        self.audio_impl
+    }
     fn emit_feedback(&mut self) {
         if let Some(fb_ep) = self.feedback.as_ref() {
             if let Some(fb) = self.audio_impl.feedback(self.nominal_fb) {
