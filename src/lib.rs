@@ -131,7 +131,7 @@ impl<T: RangeType> RangeEntry<T> {
         buf.write_all(self.min.to_le_bytes().as_ref())?;
         buf.write_all(self.max.to_le_bytes().as_ref())?;
         buf.write_all(self.res.to_le_bytes().as_ref())?;
-        Ok(T::ZERO.count_zeros() as usize * 3)
+        Ok((T::ZERO.count_zeros() as usize / 8) * 3)
     }
 }
 
@@ -1351,15 +1351,19 @@ impl<'a, B: UsbBus, AU: AudioHandler<'a, B> + ClockSource> UsbAudioClass<'a, B, 
                         channel
                     );
                 }
+                let req_len = xfer.request().length;
                 xfer.accept(|mut buf| match self.audio_impl.sample_rates() {
                     Ok(rates) => {
+                        debug!("    wLength = {} buf_len = {}", req_len, buf.len());
                         buf.write_u16::<LittleEndian>(rates.len() as u16)
                             .map_err(|_e| UsbError::BufferOverflow)?;
                         let mut written = 2usize;
-                        for rate in rates {
-                            written += rate
-                                .write(&mut buf)
-                                .map_err(|_e| UsbError::BufferOverflow)?
+                        if req_len > 2 {
+                            for rate in rates {
+                                written += rate
+                                    .write(&mut buf)
+                                    .map_err(|_e| UsbError::BufferOverflow)?
+                            }
                         }
                         Ok(written)
                     }
